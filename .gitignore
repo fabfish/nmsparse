@@ -1,0 +1,33 @@
+# HuggingFace token file
+.hf_token
+hf_token.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data and models
+/data/
+*.pt
+*.pth
+*.ckpt
+
+.specstory/

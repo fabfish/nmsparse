@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
 Test script to compare original Llama-3.1-8B-Instruct model with 
-2:4 semi-structured activation sparsity version on RTE and BoolQ datasets.
+2:4 semi-structured activation sparsity version on multiple benchmarks.
+
+Supports multi-GPU parallel evaluation with timing and visualization.
+
+Supported datasets:
+- RTE (GLUE)
+- BoolQ (SuperGLUE)
+- WinoGrande
+- ARC-Easy, ARC-Challenge
+- OpenBookQA
+- PIQA
+- MMLU
+- LongBench
 
 Usage:
     export HF_ENDPOINT=https://hf-mirror.com
@@ -10,13 +22,19 @@ Usage:
 """
 
 import os
+import json
 import copy
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.multiprocessing as mp
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 from tqdm import tqdm
+from collections import defaultdict
+import subprocess
 
 # Set HuggingFace mirror endpoint
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
@@ -220,130 +238,265 @@ def count_linear_layers(model: nn.Module) -> Dict[str, int]:
 
 
 # ============================================================================
-# RTE Zero-Shot Evaluation
+# Dataset Loading with Local Cache
 # ============================================================================
+
+def get_local_cache_path(cache_dir: str, dataset_name: str, subset_name: Optional[str] = None) -> Path:
+    """Get the local cache path for a dataset."""
+    if subset_name:
+        return Path(cache_dir) / "local_cache" / f"{dataset_name}_{subset_name}.json"
+    return Path(cache_dir) / "local_cache" / f"{dataset_name}.json"
+
+
+def save_dataset_to_local(dataset: Any, cache_path: Path) -> None:
+    """Save dataset to local JSON file."""
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    # Convert to list of dicts
+    data = [dict(item) for item in dataset]
+    with open(cache_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"  Saved to local cache: {cache_path}")
+
+
+def load_dataset_from_local(cache_path: Path) -> List[Dict]:
+    """Load dataset from local JSON file."""
+    with open(cache_path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
 
 def load_dataset_with_cache(
     dataset_name: str,
     subset_name: Optional[str] = None,
-    cache_dir: Optional[str] = "/data/datasets/"
+    cache_dir: Optional[str] = "/data/datasets/",
+    split: str = "validation",
+    trust_remote_code: bool = False
 ) -> Any:
     """
-    Load dataset with cache directory handling.
+    Load dataset with local cache support. First download saves to local JSON,
+    subsequent loads read from local cache.
     
     Args:
         dataset_name: Name of the dataset (e.g., "glue", "super_glue")
         subset_name: Subset name (e.g., "rte", "boolq")
-        cache_dir: Directory to cache the dataset. If None or not writable, uses default cache.
+        cache_dir: Directory to cache the dataset.
+        split: Dataset split to load (default: "validation")
+        trust_remote_code: Whether to trust remote code for dataset loading
         
     Returns:
-        The validation dataset
+        The dataset (as list of dicts if from local cache, or HF dataset)
     """
-    # Get HF token from environment if available
-    hf_token = os.environ.get("HF_TOKEN", None)
-    
     full_name = f"{dataset_name}/{subset_name}" if subset_name else dataset_name
     
-    # Check if cache_dir is writable, if not use default cache
+    # Check local cache first
     if cache_dir:
-        try:
-            # Try to create directory if it doesn't exist
-            os.makedirs(cache_dir, exist_ok=True)
-            # Try to create a test file to check write permissions
-            test_file = os.path.join(cache_dir, ".write_test")
+        local_cache_path = get_local_cache_path(cache_dir, dataset_name, subset_name)
+        local_cache_path = Path(str(local_cache_path).replace(".json", f"_{split}.json"))
+        
+        if local_cache_path.exists():
+            print(f"Loading {full_name} ({split}) from local cache: {local_cache_path}")
+            return load_dataset_from_local(local_cache_path)
+    
+    # Download from HuggingFace
+    hf_token = os.environ.get("HF_TOKEN", None)
+    
+    print(f"Downloading {full_name} ({split}) from HuggingFace...")
+    
+    try:
+        if subset_name:
+            dataset = load_dataset(
+                dataset_name, 
+                subset_name,
+                cache_dir=cache_dir,
+                token=hf_token,
+                trust_remote_code=trust_remote_code
+            )
+        else:
+            dataset = load_dataset(
+                dataset_name,
+                cache_dir=cache_dir,
+                token=hf_token,
+                trust_remote_code=trust_remote_code
+            )
+        
+        # Get the requested split
+        if split in dataset:
+            data = dataset[split]
+        elif "test" in dataset and split == "validation":
+            print(f"  Note: '{split}' not found, using 'test' split instead")
+            data = dataset["test"]
+        else:
+            available_splits = list(dataset.keys())
+            print(f"  Warning: '{split}' not found. Available: {available_splits}")
+            data = dataset[available_splits[0]]
+        
+        # Save to local cache
+        if cache_dir:
             try:
-                with open(test_file, 'w') as f:
-                    f.write("test")
-                os.remove(test_file)
-                print(f"Loading {full_name} dataset to {cache_dir}...")
-            except (PermissionError, OSError):
-                print(f"Warning: {cache_dir} is not writable, using default cache directory...")
-                cache_dir = None
-        except (PermissionError, OSError):
-            print(f"Warning: Cannot create {cache_dir}, using default cache directory...")
-            cache_dir = None
+                save_dataset_to_local(data, local_cache_path)
+            except Exception as e:
+                print(f"  Warning: Could not save to local cache: {e}")
+        
+        return data
+        
+    except Exception as e:
+        print(f"Error loading {full_name}: {e}")
+        raise
+
+
+# Dataset-specific loaders
+def load_rte_dataset(cache_dir: str = "/data/datasets/") -> Any:
+    """Load RTE dataset from GLUE benchmark."""
+    return load_dataset_with_cache("glue", "rte", cache_dir, split="validation")
+
+
+def load_boolq_dataset(cache_dir: str = "/data/datasets/") -> Any:
+    """Load BoolQ dataset from SuperGLUE benchmark."""
+    return load_dataset_with_cache("super_glue", "boolq", cache_dir, split="validation")
+
+
+def load_winogrande_dataset(cache_dir: str = "/data/datasets/") -> Any:
+    """Load WinoGrande dataset."""
+    return load_dataset_with_cache("winogrande", "winogrande_xl", cache_dir, split="validation")
+
+
+def load_arc_easy_dataset(cache_dir: str = "/data/datasets/") -> Any:
+    """Load ARC-Easy dataset."""
+    return load_dataset_with_cache("allenai/ai2_arc", "ARC-Easy", cache_dir, split="validation")
+
+
+def load_arc_challenge_dataset(cache_dir: str = "/data/datasets/") -> Any:
+    """Load ARC-Challenge dataset."""
+    return load_dataset_with_cache("allenai/ai2_arc", "ARC-Challenge", cache_dir, split="validation")
+
+
+def load_openbookqa_dataset(cache_dir: str = "/data/datasets/") -> Any:
+    """Load OpenBookQA dataset."""
+    return load_dataset_with_cache("allenai/openbookqa", "main", cache_dir, split="validation")
+
+
+def load_piqa_dataset(cache_dir: str = "/data/datasets/") -> Any:
+    """Load PIQA dataset."""
+    # Use piqa from the datasets hub directly (not ybisk/piqa which has script issues)
+    return load_dataset_with_cache("piqa", None, cache_dir, split="validation", trust_remote_code=True)
+
+
+def load_mmlu_dataset(cache_dir: str = "/data/datasets/", subject: str = "all") -> Any:
+    """
+    Load MMLU dataset.
     
-    if cache_dir is None:
-        print(f"Loading {full_name} dataset (using default cache directory)...")
-    
-    if subset_name:
-        dataset = load_dataset(
-            dataset_name, 
-            subset_name,
-            cache_dir=cache_dir,
-            token=hf_token
-        )
+    Args:
+        cache_dir: Cache directory
+        subject: MMLU subject to load, or "all" for all subjects
+        
+    Returns:
+        Dataset samples
+    """
+    if subject == "all":
+        return load_dataset_with_cache("cais/mmlu", "all", cache_dir, split="validation")
     else:
-        dataset = load_dataset(
-            dataset_name,
-            cache_dir=cache_dir,
-            token=hf_token
-        )
-    return dataset["validation"]
+        return load_dataset_with_cache("cais/mmlu", subject, cache_dir, split="validation")
 
 
-def load_rte_dataset(cache_dir: Optional[str] = "/data/datasets/") -> Any:
+def load_longbench_dataset(cache_dir: str = "/data/datasets/", task: str = "qasper") -> Any:
     """
-    Load RTE dataset from GLUE benchmark.
+    Load LongBench dataset.
     
     Args:
-        cache_dir: Directory to cache the dataset. If None or not writable, uses default cache.
+        cache_dir: Cache directory
+        task: LongBench task name (e.g., "qasper", "multifieldqa_en", "narrativeqa")
         
     Returns:
-        The RTE validation dataset
+        Dataset samples
     """
-    return load_dataset_with_cache("glue", "rte", cache_dir)
+    return load_dataset_with_cache("THUDM/LongBench", task, cache_dir, split="test", trust_remote_code=True)
 
 
-def load_boolq_dataset(cache_dir: Optional[str] = "/data/datasets/") -> Any:
-    """
-    Load BoolQ dataset from SuperGLUE benchmark.
-    
-    Args:
-        cache_dir: Directory to cache the dataset. If None or not writable, uses default cache.
-        
-    Returns:
-        The BoolQ validation dataset
-    """
-    return load_dataset_with_cache("super_glue", "boolq", cache_dir)
-
+# ============================================================================
+# Prompt Templates for Each Dataset
+# ============================================================================
 
 def create_rte_prompt(premise: str, hypothesis: str) -> str:
-    """
-    Create a zero-shot prompt for RTE task.
-    
-    Args:
-        premise: The premise text
-        hypothesis: The hypothesis text
-        
-    Returns:
-        Formatted prompt string
-    """
-    prompt = f'''Given the premise: "{premise}"
+    """Create a zero-shot prompt for RTE task."""
+    return f'''Given the premise: "{premise}"
 
 Question: Does this imply the following hypothesis: "{hypothesis}"?
 
 Answer (Yes or No):'''
-    return prompt
 
 
 def create_boolq_prompt(passage: str, question: str) -> str:
-    """
-    Create a zero-shot prompt for BoolQ task.
-    
-    Args:
-        passage: The passage text
-        question: The question about the passage
-        
-    Returns:
-        Formatted prompt string
-    """
-    prompt = f'''Passage: "{passage}"
+    """Create a zero-shot prompt for BoolQ task."""
+    return f'''Passage: "{passage}"
 
 Question: {question}
 
 Answer (Yes or No):'''
-    return prompt
+
+
+def create_winogrande_prompt(sentence: str, option1: str, option2: str) -> str:
+    """Create a zero-shot prompt for WinoGrande task."""
+    return f'''Complete the sentence by choosing the correct option.
+
+Sentence: {sentence}
+
+Option 1: {option1}
+Option 2: {option2}
+
+Which option correctly fills the blank? Answer with just the number (1 or 2):'''
+
+
+def create_arc_prompt(question: str, choices: List[str], choice_labels: List[str]) -> str:
+    """Create a zero-shot prompt for ARC task."""
+    choices_text = "\n".join([f"{label}. {text}" for label, text in zip(choice_labels, choices)])
+    return f'''Question: {question}
+
+{choices_text}
+
+Answer with just the letter:'''
+
+
+def create_openbookqa_prompt(question: str, choices: List[str], choice_labels: List[str]) -> str:
+    """Create a zero-shot prompt for OpenBookQA task."""
+    choices_text = "\n".join([f"{label}. {text}" for label, text in zip(choice_labels, choices)])
+    return f'''Question: {question}
+
+{choices_text}
+
+Answer with just the letter:'''
+
+
+def create_piqa_prompt(goal: str, sol1: str, sol2: str) -> str:
+    """Create a zero-shot prompt for PIQA task."""
+    return f'''Goal: {goal}
+
+Solution 1: {sol1}
+Solution 2: {sol2}
+
+Which solution is better? Answer with just the number (1 or 2):'''
+
+
+def create_mmlu_prompt(question: str, choices: List[str]) -> str:
+    """Create a zero-shot prompt for MMLU task."""
+    choice_labels = ['A', 'B', 'C', 'D']
+    choices_text = "\n".join([f"{label}. {text}" for label, text in zip(choice_labels, choices)])
+    return f'''Question: {question}
+
+{choices_text}
+
+Answer with just the letter (A, B, C, or D):'''
+
+
+def create_longbench_prompt(context: str, question: str) -> str:
+    """Create a prompt for LongBench task."""
+    # Truncate context if too long (for display purposes)
+    max_context_len = 4000
+    if len(context) > max_context_len:
+        context = context[:max_context_len] + "..."
+    return f'''Context: {context}
+
+Question: {question}
+
+Answer:'''
 
 
 def get_token_logprob(
@@ -386,6 +539,51 @@ def get_token_logprob(
     log_probs = F.log_softmax(last_logits, dim=-1)
     
     return log_probs[target_id].item()
+
+
+def get_choice_logprobs(
+    model: nn.Module,
+    tokenizer: Any,
+    prompt: str,
+    choices: List[str],
+    device: str = "cuda"
+) -> List[float]:
+    """
+    Get log probabilities for multiple choice options.
+    
+    Args:
+        model: The language model
+        tokenizer: The tokenizer
+        prompt: The input prompt
+        choices: List of choice tokens (e.g., ["A", "B", "C", "D"])
+        device: Device to run on
+        
+    Returns:
+        List of log probabilities for each choice
+    """
+    # Tokenize prompt
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    
+    # Forward pass
+    with torch.no_grad():
+        outputs = model(**inputs)
+        logits = outputs.logits
+    
+    # Get log probabilities for the last position
+    last_logits = logits[0, -1, :]
+    log_probs = F.log_softmax(last_logits, dim=-1)
+    
+    # Get log prob for each choice
+    choice_logprobs = []
+    for choice in choices:
+        target_ids = tokenizer.encode(choice, add_special_tokens=False)
+        if len(target_ids) > 0:
+            target_id = target_ids[0]
+        else:
+            target_id = tokenizer.encode(" " + choice, add_special_tokens=False)[0]
+        choice_logprobs.append(log_probs[target_id].item())
+    
+    return choice_logprobs
 
 
 def evaluate_rte_zero_shot(
@@ -455,60 +653,377 @@ def evaluate_boolq_zero_shot(
     device: str = "cuda",
     max_samples: Optional[int] = None
 ) -> Dict[str, float]:
-    """
-    Evaluate model on BoolQ dataset using zero-shot classification.
-    
-    Args:
-        model: The language model
-        tokenizer: The tokenizer
-        dataset: The BoolQ validation dataset
-        device: Device to run on
-        max_samples: Maximum number of samples to evaluate (None for all)
-        
-    Returns:
-        Dictionary containing accuracy and other metrics
-    """
+    """Evaluate model on BoolQ dataset using zero-shot classification."""
     model.eval()
-    
     correct = 0
     total = 0
     
-    # BoolQ labels: True = Yes, False = No
-    samples = dataset if max_samples is None else dataset.select(range(min(max_samples, len(dataset))))
+    samples = dataset if max_samples is None else (
+        dataset[:max_samples] if isinstance(dataset, list) else dataset.select(range(min(max_samples, len(dataset))))
+    )
     
     print(f"Evaluating BoolQ on {len(samples)} samples...")
     
     for sample in tqdm(samples, desc="Evaluating BoolQ"):
         passage = sample["passage"]
         question = sample["question"]
-        true_label = sample["label"]  # Boolean: True or False
+        true_label = sample["label"]
         
-        # Create prompt
         prompt = create_boolq_prompt(passage, question)
-        
-        # Get log probabilities for "Yes" and "No"
         yes_logprob = get_token_logprob(model, tokenizer, prompt, "Yes", device)
         no_logprob = get_token_logprob(model, tokenizer, prompt, "No", device)
         
-        # Predict based on higher probability
         predicted = True if yes_logprob > no_logprob else False
-        
         if predicted == true_label:
             correct += 1
         total += 1
     
-    accuracy = correct / total if total > 0 else 0.0
+    return {"accuracy": correct / total if total > 0 else 0.0, "correct": correct, "total": total}
+
+
+def evaluate_winogrande_zero_shot(
+    model: nn.Module,
+    tokenizer: Any,
+    dataset: Any,
+    device: str = "cuda",
+    max_samples: Optional[int] = None
+) -> Dict[str, float]:
+    """Evaluate model on WinoGrande dataset."""
+    model.eval()
+    correct = 0
+    total = 0
     
-    return {
-        "accuracy": accuracy,
-        "correct": correct,
-        "total": total
-    }
+    samples = dataset if max_samples is None else (
+        dataset[:max_samples] if isinstance(dataset, list) else dataset.select(range(min(max_samples, len(dataset))))
+    )
+    
+    print(f"Evaluating WinoGrande on {len(samples)} samples...")
+    
+    for sample in tqdm(samples, desc="Evaluating WinoGrande"):
+        sentence = sample["sentence"]
+        option1 = sample["option1"]
+        option2 = sample["option2"]
+        answer = sample["answer"]  # "1" or "2"
+        
+        prompt = create_winogrande_prompt(sentence, option1, option2)
+        logprobs = get_choice_logprobs(model, tokenizer, prompt, ["1", "2"], device)
+        
+        predicted = "1" if logprobs[0] > logprobs[1] else "2"
+        if predicted == answer:
+            correct += 1
+        total += 1
+    
+    return {"accuracy": correct / total if total > 0 else 0.0, "correct": correct, "total": total}
+
+
+def evaluate_arc_zero_shot(
+    model: nn.Module,
+    tokenizer: Any,
+    dataset: Any,
+    device: str = "cuda",
+    max_samples: Optional[int] = None,
+    task_name: str = "ARC"
+) -> Dict[str, float]:
+    """Evaluate model on ARC dataset (Easy or Challenge)."""
+    model.eval()
+    correct = 0
+    total = 0
+    
+    samples = dataset if max_samples is None else (
+        dataset[:max_samples] if isinstance(dataset, list) else dataset.select(range(min(max_samples, len(dataset))))
+    )
+    
+    print(f"Evaluating {task_name} on {len(samples)} samples...")
+    
+    for sample in tqdm(samples, desc=f"Evaluating {task_name}"):
+        question = sample["question"]
+        choices_data = sample["choices"]
+        answer_key = sample["answerKey"]
+        
+        # Handle both dict and list formats
+        if isinstance(choices_data, dict):
+            choice_labels = choices_data["label"]
+            choice_texts = choices_data["text"]
+        else:
+            choice_labels = [c["label"] for c in choices_data]
+            choice_texts = [c["text"] for c in choices_data]
+        
+        prompt = create_arc_prompt(question, choice_texts, choice_labels)
+        logprobs = get_choice_logprobs(model, tokenizer, prompt, choice_labels, device)
+        
+        predicted_idx = logprobs.index(max(logprobs))
+        predicted = choice_labels[predicted_idx]
+        
+        if predicted == answer_key:
+            correct += 1
+        total += 1
+    
+    return {"accuracy": correct / total if total > 0 else 0.0, "correct": correct, "total": total}
+
+
+def evaluate_openbookqa_zero_shot(
+    model: nn.Module,
+    tokenizer: Any,
+    dataset: Any,
+    device: str = "cuda",
+    max_samples: Optional[int] = None
+) -> Dict[str, float]:
+    """Evaluate model on OpenBookQA dataset."""
+    model.eval()
+    correct = 0
+    total = 0
+    
+    samples = dataset if max_samples is None else (
+        dataset[:max_samples] if isinstance(dataset, list) else dataset.select(range(min(max_samples, len(dataset))))
+    )
+    
+    print(f"Evaluating OpenBookQA on {len(samples)} samples...")
+    
+    for sample in tqdm(samples, desc="Evaluating OpenBookQA"):
+        question = sample["question_stem"]
+        choices_data = sample["choices"]
+        answer_key = sample["answerKey"]
+        
+        if isinstance(choices_data, dict):
+            choice_labels = choices_data["label"]
+            choice_texts = choices_data["text"]
+        else:
+            choice_labels = [c["label"] for c in choices_data]
+            choice_texts = [c["text"] for c in choices_data]
+        
+        prompt = create_openbookqa_prompt(question, choice_texts, choice_labels)
+        logprobs = get_choice_logprobs(model, tokenizer, prompt, choice_labels, device)
+        
+        predicted_idx = logprobs.index(max(logprobs))
+        predicted = choice_labels[predicted_idx]
+        
+        if predicted == answer_key:
+            correct += 1
+        total += 1
+    
+    return {"accuracy": correct / total if total > 0 else 0.0, "correct": correct, "total": total}
+
+
+def evaluate_piqa_zero_shot(
+    model: nn.Module,
+    tokenizer: Any,
+    dataset: Any,
+    device: str = "cuda",
+    max_samples: Optional[int] = None
+) -> Dict[str, float]:
+    """Evaluate model on PIQA dataset."""
+    model.eval()
+    correct = 0
+    total = 0
+    
+    samples = dataset if max_samples is None else (
+        dataset[:max_samples] if isinstance(dataset, list) else dataset.select(range(min(max_samples, len(dataset))))
+    )
+    
+    print(f"Evaluating PIQA on {len(samples)} samples...")
+    
+    for sample in tqdm(samples, desc="Evaluating PIQA"):
+        goal = sample["goal"]
+        sol1 = sample["sol1"]
+        sol2 = sample["sol2"]
+        label = sample["label"]  # 0 or 1
+        
+        prompt = create_piqa_prompt(goal, sol1, sol2)
+        logprobs = get_choice_logprobs(model, tokenizer, prompt, ["1", "2"], device)
+        
+        predicted = 0 if logprobs[0] > logprobs[1] else 1
+        if predicted == label:
+            correct += 1
+        total += 1
+    
+    return {"accuracy": correct / total if total > 0 else 0.0, "correct": correct, "total": total}
+
+
+def evaluate_mmlu_zero_shot(
+    model: nn.Module,
+    tokenizer: Any,
+    dataset: Any,
+    device: str = "cuda",
+    max_samples: Optional[int] = None
+) -> Dict[str, float]:
+    """Evaluate model on MMLU dataset."""
+    model.eval()
+    correct = 0
+    total = 0
+    
+    samples = dataset if max_samples is None else (
+        dataset[:max_samples] if isinstance(dataset, list) else dataset.select(range(min(max_samples, len(dataset))))
+    )
+    
+    print(f"Evaluating MMLU on {len(samples)} samples...")
+    
+    for sample in tqdm(samples, desc="Evaluating MMLU"):
+        question = sample["question"]
+        choices = sample["choices"]
+        answer = sample["answer"]  # 0, 1, 2, or 3
+        
+        prompt = create_mmlu_prompt(question, choices)
+        choice_labels = ["A", "B", "C", "D"]
+        logprobs = get_choice_logprobs(model, tokenizer, prompt, choice_labels, device)
+        
+        predicted = logprobs.index(max(logprobs))
+        if predicted == answer:
+            correct += 1
+        total += 1
+    
+    return {"accuracy": correct / total if total > 0 else 0.0, "correct": correct, "total": total}
+
+
+def evaluate_longbench_zero_shot(
+    model: nn.Module,
+    tokenizer: Any,
+    dataset: Any,
+    device: str = "cuda",
+    max_samples: Optional[int] = None,
+    max_length: int = 4096
+) -> Dict[str, float]:
+    """
+    Evaluate model on LongBench dataset.
+    Uses F1 score for evaluation since LongBench is a generation task.
+    """
+    model.eval()
+    
+    samples = dataset if max_samples is None else (
+        dataset[:max_samples] if isinstance(dataset, list) else dataset.select(range(min(max_samples, len(dataset))))
+    )
+    
+    print(f"Evaluating LongBench on {len(samples)} samples...")
+    
+    total_f1 = 0.0
+    total = 0
+    
+    for sample in tqdm(samples, desc="Evaluating LongBench"):
+        context = sample["context"]
+        question = sample["input"]
+        answers = sample["answers"]  # List of acceptable answers
+        
+        # Truncate context to fit in model's context window
+        prompt = create_longbench_prompt(context, question)
+        
+        # Tokenize and truncate
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_length).to(device)
+        
+        # Generate response
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=50,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id
+            )
+        
+        # Decode response
+        generated = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
+        
+        # Calculate F1 score against all acceptable answers
+        best_f1 = 0.0
+        for answer in answers:
+            f1 = compute_f1(generated, answer)
+            best_f1 = max(best_f1, f1)
+        
+        total_f1 += best_f1
+        total += 1
+    
+    avg_f1 = total_f1 / total if total > 0 else 0.0
+    
+    return {"accuracy": avg_f1, "f1_score": avg_f1, "total": total}
+
+
+def compute_f1(prediction: str, ground_truth: str) -> float:
+    """Compute token-level F1 score between prediction and ground truth."""
+    pred_tokens = prediction.lower().split()
+    truth_tokens = ground_truth.lower().split()
+    
+    if len(pred_tokens) == 0 or len(truth_tokens) == 0:
+        return float(pred_tokens == truth_tokens)
+    
+    common = set(pred_tokens) & set(truth_tokens)
+    num_common = len(common)
+    
+    if num_common == 0:
+        return 0.0
+    
+    precision = num_common / len(pred_tokens)
+    recall = num_common / len(truth_tokens)
+    f1 = 2 * precision * recall / (precision + recall)
+    
+    return f1
 
 
 # ============================================================================
 # GPU Utilities
 # ============================================================================
+
+def get_all_gpu_info() -> List[Dict[str, Any]]:
+    """
+    Get information about all available GPUs.
+    
+    Returns:
+        List of dictionaries with GPU info
+    """
+    gpus = []
+    if not torch.cuda.is_available():
+        return gpus
+    
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=index,name,memory.used,memory.total,memory.free,utilization.gpu', 
+             '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, check=True
+        )
+        
+        for line in result.stdout.strip().split('\n'):
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) >= 6:
+                gpus.append({
+                    'index': int(parts[0]),
+                    'name': parts[1],
+                    'memory_used': int(parts[2]),
+                    'memory_total': int(parts[3]),
+                    'memory_free': int(parts[4]),
+                    'utilization': int(parts[5])
+                })
+    except Exception as e:
+        print(f"Warning: Could not query GPU status: {e}")
+        # Fallback to PyTorch detection
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            gpus.append({
+                'index': i,
+                'name': props.name,
+                'memory_total': props.total_memory // (1024**2),
+                'memory_used': 0,
+                'memory_free': props.total_memory // (1024**2),
+                'utilization': 0
+            })
+    
+    return gpus
+
+
+def get_available_gpus(min_free_memory_mb: int = 20000) -> List[int]:
+    """
+    Get list of available GPUs with sufficient free memory.
+    
+    Args:
+        min_free_memory_mb: Minimum free memory in MB required
+        
+    Returns:
+        List of GPU indices that are available
+    """
+    gpus = get_all_gpu_info()
+    available = []
+    
+    for gpu in gpus:
+        if gpu['memory_free'] >= min_free_memory_mb:
+            available.append(gpu['index'])
+    
+    return available if available else [0] if gpus else []
+
 
 def get_free_gpu() -> int:
     """
@@ -520,89 +1035,416 @@ def get_free_gpu() -> int:
     if not torch.cuda.is_available():
         return -1
     
-    import subprocess
-    try:
-        result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=index,memory.used,memory.total', '--format=csv,noheader,nounits'],
-            capture_output=True, text=True, check=True
-        )
-        
-        best_gpu = 0
-        min_used = float('inf')
-        
-        for line in result.stdout.strip().split('\n'):
-            parts = line.split(',')
-            if len(parts) >= 3:
-                gpu_idx = int(parts[0].strip())
-                memory_used = int(parts[1].strip())
-                
-                if memory_used < min_used:
-                    min_used = memory_used
-                    best_gpu = gpu_idx
-        
-        return best_gpu
-    except Exception as e:
-        print(f"Warning: Could not query GPU status: {e}")
+    gpus = get_all_gpu_info()
+    if not gpus:
         return 0
+    
+    best_gpu = max(gpus, key=lambda x: x['memory_free'])
+    return best_gpu['index']
 
 
-def print_gpu_info(gpu_id: int) -> None:
+def print_gpu_info(gpu_ids: Optional[List[int]] = None) -> None:
     """
-    Print detailed information about the selected GPU.
+    Print detailed information about GPUs.
     
     Args:
-        gpu_id: The GPU index to print info for
+        gpu_ids: List of GPU indices to print info for. If None, prints all.
     """
     if not torch.cuda.is_available():
         print("CUDA is not available!")
         return
     
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 80)
     print("GPU INFORMATION")
-    print("=" * 70)
+    print("=" * 80)
     
-    # Get GPU properties
-    props = torch.cuda.get_device_properties(gpu_id)
+    gpus = get_all_gpu_info()
     
-    print(f"Selected GPU: {gpu_id}")
-    print(f"GPU Name: {props.name}")
-    print(f"GPU Memory Total: {props.total_memory / 1024**3:.2f} GB")
-    print(f"CUDA Capability: {props.major}.{props.minor}")
-    print(f"Multi-Processor Count: {props.multi_processor_count}")
+    print(f"\nTotal GPUs detected: {len(gpus)}")
+    if gpu_ids:
+        print(f"GPUs to be used: {gpu_ids}")
     
-    # Current memory usage
-    if torch.cuda.is_available():
-        torch.cuda.set_device(gpu_id)
-        allocated = torch.cuda.memory_allocated(gpu_id) / 1024**3
-        reserved = torch.cuda.memory_reserved(gpu_id) / 1024**3
-        print(f"Memory Allocated: {allocated:.2f} GB")
-        print(f"Memory Reserved: {reserved:.2f} GB")
+    print("\n" + "-" * 80)
+    print(f"{'Index':<6} {'Name':<40} {'Used':<12} {'Free':<12} {'Total':<12} {'Util':<8}")
+    print("-" * 80)
     
-    # Also print all GPU status
-    print("\nAll GPU Status:")
-    print("-" * 70)
-    import subprocess
+    for gpu in gpus:
+        marker = " *" if gpu_ids and gpu['index'] in gpu_ids else ""
+        print(f"{gpu['index']:<6} {gpu['name']:<40} {gpu['memory_used']:<12} {gpu['memory_free']:<12} {gpu['memory_total']:<12} {gpu['utilization']}%{marker}")
+    
+    print("-" * 80)
+    print("(* = selected for evaluation)")
+    print("=" * 80 + "\n")
+
+
+# ============================================================================
+# Timing Utilities
+# ============================================================================
+
+class Timer:
+    """Simple timer for measuring execution time."""
+    
+    def __init__(self):
+        self.times = {}
+        self.start_times = {}
+    
+    def start(self, name: str):
+        """Start timing a named section."""
+        self.start_times[name] = time.time()
+    
+    def stop(self, name: str) -> float:
+        """Stop timing and return elapsed time in seconds."""
+        if name not in self.start_times:
+            return 0.0
+        elapsed = time.time() - self.start_times[name]
+        self.times[name] = elapsed
+        return elapsed
+    
+    def get(self, name: str) -> float:
+        """Get recorded time for a section."""
+        return self.times.get(name, 0.0)
+    
+    def format_time(self, seconds: float) -> str:
+        """Format time in human-readable format."""
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        elif seconds < 3600:
+            mins = int(seconds // 60)
+            secs = seconds % 60
+            return f"{mins}m {secs:.1f}s"
+        else:
+            hours = int(seconds // 3600)
+            mins = int((seconds % 3600) // 60)
+            secs = seconds % 60
+            return f"{hours}h {mins}m {secs:.0f}s"
+
+
+# ============================================================================
+# Visualization
+# ============================================================================
+
+def create_visualization(
+    results: Dict[str, Dict[str, Dict[str, float]]],
+    timing_info: Dict[str, float],
+    output_dir: str = "results"
+) -> str:
+    """
+    Create visualization of evaluation results.
+    
+    Args:
+        results: Dictionary with 'original' and 'sparse' results for each task
+        timing_info: Dictionary with timing information
+        output_dir: Directory to save visualizations
+        
+    Returns:
+        Path to the saved visualization
+    """
     try:
-        result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=index,name,memory.used,memory.total,utilization.gpu', 
-             '--format=csv,noheader'],
-            capture_output=True, text=True, check=True
-        )
-        print(f"{'Index':<6} {'Name':<45} {'Used':<12} {'Total':<12} {'Util':<8}")
-        print("-" * 70)
-        for line in result.stdout.strip().split('\n'):
-            parts = [p.strip() for p in line.split(',')]
-            if len(parts) >= 5:
-                print(f"{parts[0]:<6} {parts[1]:<45} {parts[2]:<12} {parts[3]:<12} {parts[4]:<8}")
-    except Exception as e:
-        print(f"Could not query nvidia-smi: {e}")
+        import matplotlib
+        matplotlib.use('Agg')  # Non-interactive backend
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print("Warning: matplotlib not installed. Skipping visualization.")
+        return ""
     
-    print("=" * 70 + "\n")
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Get task names and accuracies
+    tasks = list(results['original'].keys())
+    original_accs = [results['original'][t]['accuracy'] * 100 for t in tasks]
+    sparse_accs = [results['sparse'][t]['accuracy'] * 100 for t in tasks]
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Model Evaluation: Original vs 2:4 Sparse Activation', fontsize=14, fontweight='bold')
+    
+    # 1. Bar chart comparison
+    ax1 = axes[0, 0]
+    x = np.arange(len(tasks))
+    width = 0.35
+    
+    bars1 = ax1.bar(x - width/2, original_accs, width, label='Original', color='#2ecc71', alpha=0.8)
+    bars2 = ax1.bar(x + width/2, sparse_accs, width, label='2:4 Sparse', color='#e74c3c', alpha=0.8)
+    
+    ax1.set_xlabel('Task')
+    ax1.set_ylabel('Accuracy (%)')
+    ax1.set_title('Accuracy Comparison by Task')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(tasks, rotation=45, ha='right')
+    ax1.legend()
+    ax1.set_ylim(0, 100)
+    ax1.grid(axis='y', alpha=0.3)
+    
+    # Add value labels on bars
+    for bar in bars1:
+        height = bar.get_height()
+        ax1.annotate(f'{height:.1f}', xy=(bar.get_x() + bar.get_width()/2, height),
+                    xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=8)
+    for bar in bars2:
+        height = bar.get_height()
+        ax1.annotate(f'{height:.1f}', xy=(bar.get_x() + bar.get_width()/2, height),
+                    xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=8)
+    
+    # 2. Difference chart
+    ax2 = axes[0, 1]
+    diffs = [s - o for o, s in zip(original_accs, sparse_accs)]
+    colors = ['#e74c3c' if d < 0 else '#2ecc71' for d in diffs]
+    bars = ax2.bar(tasks, diffs, color=colors, alpha=0.8)
+    ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    ax2.set_xlabel('Task')
+    ax2.set_ylabel('Accuracy Difference (%)')
+    ax2.set_title('Sparse - Original Accuracy Difference')
+    ax2.set_xticklabels(tasks, rotation=45, ha='right')
+    ax2.grid(axis='y', alpha=0.3)
+    
+    for bar, diff in zip(bars, diffs):
+        height = bar.get_height()
+        ax2.annotate(f'{diff:+.2f}', xy=(bar.get_x() + bar.get_width()/2, height),
+                    xytext=(0, 3 if height >= 0 else -12), textcoords="offset points", 
+                    ha='center', va='bottom' if height >= 0 else 'top', fontsize=9)
+    
+    # 3. Timing chart
+    ax3 = axes[1, 0]
+    timing_tasks = [k for k in timing_info.keys() if k.startswith('original_') or k.startswith('sparse_')]
+    
+    if timing_tasks:
+        orig_times = {k.replace('original_', ''): v for k, v in timing_info.items() if k.startswith('original_')}
+        sparse_times = {k.replace('sparse_', ''): v for k, v in timing_info.items() if k.startswith('sparse_')}
+        
+        common_tasks = sorted(set(orig_times.keys()) & set(sparse_times.keys()))
+        if common_tasks:
+            x = np.arange(len(common_tasks))
+            orig_t = [orig_times[t] for t in common_tasks]
+            sparse_t = [sparse_times[t] for t in common_tasks]
+            
+            bars1 = ax3.bar(x - width/2, orig_t, width, label='Original', color='#3498db', alpha=0.8)
+            bars2 = ax3.bar(x + width/2, sparse_t, width, label='2:4 Sparse', color='#9b59b6', alpha=0.8)
+            
+            ax3.set_xlabel('Task')
+            ax3.set_ylabel('Time (seconds)')
+            ax3.set_title('Evaluation Time by Task')
+            ax3.set_xticks(x)
+            ax3.set_xticklabels(common_tasks, rotation=45, ha='right')
+            ax3.legend()
+            ax3.grid(axis='y', alpha=0.3)
+    else:
+        ax3.text(0.5, 0.5, 'No timing data available', ha='center', va='center', transform=ax3.transAxes)
+        ax3.set_title('Evaluation Time by Task')
+    
+    # 4. Summary table
+    ax4 = axes[1, 1]
+    ax4.axis('off')
+    
+    # Create summary data
+    avg_orig = np.mean(original_accs)
+    avg_sparse = np.mean(sparse_accs)
+    total_time = timing_info.get('total', 0)
+    
+    summary_text = f"""
+    ╔══════════════════════════════════════════════════════╗
+    ║                  EVALUATION SUMMARY                   ║
+    ╠══════════════════════════════════════════════════════╣
+    ║  Tasks Evaluated: {len(tasks):<35} ║
+    ║  Average Original Accuracy: {avg_orig:>6.2f}%                 ║
+    ║  Average Sparse Accuracy:   {avg_sparse:>6.2f}%                 ║
+    ║  Average Difference:        {avg_sparse - avg_orig:>+6.2f}%                 ║
+    ║  Total Evaluation Time:     {total_time/60:>6.1f} minutes           ║
+    ╚══════════════════════════════════════════════════════╝
+    """
+    
+    ax4.text(0.1, 0.5, summary_text, transform=ax4.transAxes, fontsize=11,
+             verticalalignment='center', fontfamily='monospace',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout()
+    
+    # Save figure
+    output_path = os.path.join(output_dir, f"evaluation_results_{timestamp}.png")
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"\nVisualization saved to: {output_path}")
+    return output_path
+
+
+def save_results_to_json(
+    results: Dict[str, Dict[str, Dict[str, float]]],
+    timing_info: Dict[str, float],
+    config: Dict[str, Any],
+    output_dir: str = "results"
+) -> str:
+    """
+    Save evaluation results to JSON file.
+    
+    Args:
+        results: Dictionary with 'original' and 'sparse' results
+        timing_info: Dictionary with timing information
+        config: Configuration dictionary
+        output_dir: Directory to save results
+        
+    Returns:
+        Path to saved JSON file
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    output_data = {
+        "timestamp": datetime.now().isoformat(),
+        "config": config,
+        "results": results,
+        "timing": timing_info,
+        "summary": {}
+    }
+    
+    # Calculate summary
+    tasks = list(results.get('original', {}).keys())
+    if tasks:
+        orig_accs = [results['original'][t]['accuracy'] for t in tasks]
+        sparse_accs = [results['sparse'][t]['accuracy'] for t in tasks]
+        output_data["summary"] = {
+            "num_tasks": len(tasks),
+            "avg_original_accuracy": sum(orig_accs) / len(orig_accs),
+            "avg_sparse_accuracy": sum(sparse_accs) / len(sparse_accs),
+            "avg_difference": (sum(sparse_accs) - sum(orig_accs)) / len(tasks)
+        }
+    
+    output_path = os.path.join(output_dir, f"evaluation_results_{timestamp}.json")
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(output_data, f, indent=2, ensure_ascii=False)
+    
+    print(f"Results saved to: {output_path}")
+    return output_path
 
 
 # ============================================================================
 # Main Function
 # ============================================================================
+
+def evaluate_all_tasks(
+    model: nn.Module,
+    tokenizer: Any,
+    datasets: Dict[str, Any],
+    device: str,
+    max_samples: Optional[int] = None,
+    timer: Optional[Timer] = None,
+    prefix: str = ""
+) -> Dict[str, Dict[str, float]]:
+    """
+    Evaluate model on all loaded datasets with timing.
+    
+    Args:
+        model: The language model
+        tokenizer: The tokenizer
+        datasets: Dictionary of dataset name -> dataset
+        device: Device to run on
+        max_samples: Maximum samples per dataset
+        timer: Timer object for timing (optional)
+        prefix: Prefix for timing keys (e.g., "original_" or "sparse_")
+        
+    Returns:
+        Dictionary of task name -> results
+    """
+    results = {}
+    
+    for task_name, dataset in datasets.items():
+        print(f"\n--- Evaluating {task_name} ---")
+        
+        if timer:
+            timer.start(f"{prefix}{task_name}")
+        
+        if task_name == "rte":
+            results[task_name] = evaluate_rte_zero_shot(model, tokenizer, dataset, device, max_samples)
+        elif task_name == "boolq":
+            results[task_name] = evaluate_boolq_zero_shot(model, tokenizer, dataset, device, max_samples)
+        elif task_name == "winogrande":
+            results[task_name] = evaluate_winogrande_zero_shot(model, tokenizer, dataset, device, max_samples)
+        elif task_name == "arc_easy":
+            results[task_name] = evaluate_arc_zero_shot(model, tokenizer, dataset, device, max_samples, "ARC-Easy")
+        elif task_name == "arc_challenge":
+            results[task_name] = evaluate_arc_zero_shot(model, tokenizer, dataset, device, max_samples, "ARC-Challenge")
+        elif task_name == "openbookqa":
+            results[task_name] = evaluate_openbookqa_zero_shot(model, tokenizer, dataset, device, max_samples)
+        elif task_name == "piqa":
+            results[task_name] = evaluate_piqa_zero_shot(model, tokenizer, dataset, device, max_samples)
+        elif task_name == "mmlu":
+            results[task_name] = evaluate_mmlu_zero_shot(model, tokenizer, dataset, device, max_samples)
+        elif task_name == "longbench":
+            results[task_name] = evaluate_longbench_zero_shot(model, tokenizer, dataset, device, max_samples)
+        else:
+            print(f"  Unknown task: {task_name}, skipping...")
+            continue
+        
+        if timer:
+            elapsed = timer.stop(f"{prefix}{task_name}")
+            results[task_name]['time'] = elapsed
+            print(f"  {task_name}: {results[task_name]['accuracy']:.4f} (time: {timer.format_time(elapsed)})")
+        else:
+            print(f"  {task_name}: {results[task_name]['accuracy']:.4f}")
+    
+    return results
+
+
+def print_results_table(
+    original_results: Dict[str, Dict[str, float]],
+    sparse_results: Dict[str, Dict[str, float]],
+    tasks_to_run: List[str],
+    timer: Timer
+) -> None:
+    """Print a detailed results table with timing information."""
+    
+    print("\n" + "=" * 100)
+    print("DETAILED RESULTS TABLE")
+    print("=" * 100)
+    
+    # Header
+    print(f"\n{'Task':<15} {'Original':<10} {'Sparse':<10} {'Diff':<10} {'Orig Time':<12} {'Sparse Time':<12} {'Samples':<8}")
+    print("-" * 100)
+    
+    total_original = 0.0
+    total_sparse = 0.0
+    total_orig_time = 0.0
+    total_sparse_time = 0.0
+    num_tasks = 0
+    
+    for task_name in tasks_to_run:
+        if task_name in original_results and task_name in sparse_results:
+            orig_acc = original_results[task_name]['accuracy']
+            sparse_acc = sparse_results[task_name]['accuracy']
+            diff = sparse_acc - orig_acc
+            total = original_results[task_name]['total']
+            
+            orig_time = timer.get(f"original_{task_name}")
+            sparse_time = timer.get(f"sparse_{task_name}")
+            
+            print(f"{task_name:<15} {orig_acc:<10.4f} {sparse_acc:<10.4f} {diff:+10.4f} "
+                  f"{timer.format_time(orig_time):<12} {timer.format_time(sparse_time):<12} {total:<8}")
+            
+            total_original += orig_acc
+            total_sparse += sparse_acc
+            total_orig_time += orig_time
+            total_sparse_time += sparse_time
+            num_tasks += 1
+    
+    print("-" * 100)
+    
+    if num_tasks > 0:
+        avg_original = total_original / num_tasks
+        avg_sparse = total_sparse / num_tasks
+        avg_diff = avg_sparse - avg_original
+        print(f"{'AVERAGE':<15} {avg_original:<10.4f} {avg_sparse:<10.4f} {avg_diff:+10.4f} "
+              f"{timer.format_time(total_orig_time):<12} {timer.format_time(total_sparse_time):<12}")
+    
+    print("=" * 100)
+    
+    # Print total times
+    print(f"\nTotal evaluation time:")
+    print(f"  Original model: {timer.format_time(total_orig_time)}")
+    print(f"  Sparse model:   {timer.format_time(total_sparse_time)}")
+    print(f"  Overall:        {timer.format_time(timer.get('total'))}")
+
 
 def main():
     """Main function to run the comparison experiment."""
@@ -610,81 +1452,167 @@ def main():
     # Configuration
     model_path = "/data/models/Llama-3.1-8B-Instruct"
     dataset_cache_dir = "/data/datasets/"
+    output_dir = "results"
     max_samples = None  # Set to a number for quick testing, None for full evaluation
     
-    # Find the best available GPU (most free memory)
-    if torch.cuda.is_available():
-        gpu_id = get_free_gpu()
-        device = f"cuda:{gpu_id}"
-        print_gpu_info(gpu_id)
-    else:
-        device = "cpu"
-        gpu_id = -1
+    # Tasks to evaluate (comment out tasks you don't want to run)
+    tasks_to_run = [
+        "rte",
+        "boolq",
+        "winogrande",
+        "arc_easy",
+        "arc_challenge",
+        "openbookqa",
+        "piqa",
+        "mmlu",
+        "longbench",
+    ]
     
-    print("=" * 70)
-    print("RTE & BoolQ Zero-Shot Evaluation: Original vs 2:4 Activation Sparse Model")
-    print("=" * 70)
+    # Initialize timer
+    timer = Timer()
+    timer.start('total')
+    
+    # ========================================================================
+    # GPU Detection and Multi-GPU Setup
+    # ========================================================================
+    print("\n" + "=" * 80)
+    print("MULTI-GPU DETECTION")
+    print("=" * 80)
+    
+    if torch.cuda.is_available():
+        available_gpus = get_available_gpus(min_free_memory_mb=20000)
+        all_gpus = get_all_gpu_info()
+        
+        print(f"\nTotal GPUs: {len(all_gpus)}")
+        print(f"Available GPUs (>20GB free): {available_gpus}")
+        
+        if len(available_gpus) >= 2:
+            # Use multiple GPUs
+            gpu_ids = available_gpus[:min(4, len(available_gpus))]  # Use up to 4 GPUs
+            print(f"Using multiple GPUs: {gpu_ids}")
+            device_map = "auto"  # Let HuggingFace distribute across available GPUs
+            primary_device = f"cuda:{gpu_ids[0]}"
+        else:
+            # Single GPU
+            gpu_id = available_gpus[0] if available_gpus else 0
+            gpu_ids = [gpu_id]
+            device_map = {"": gpu_id}
+            primary_device = f"cuda:{gpu_id}"
+        
+        print_gpu_info(gpu_ids)
+    else:
+        gpu_ids = []
+        device_map = "cpu"
+        primary_device = "cpu"
+        print("CUDA not available. Using CPU.")
+    
+    # Configuration for model loading
+    config = {
+        "model_path": model_path,
+        "dataset_cache_dir": dataset_cache_dir,
+        "max_samples": max_samples,
+        "tasks": tasks_to_run,
+        "gpu_ids": gpu_ids,
+        "device_map": str(device_map),
+        "timestamp": datetime.now().isoformat()
+    }
+    
+    print("\n" + "=" * 80)
+    print("EVALUATION CONFIGURATION")
+    print("=" * 80)
     print(f"Model: {model_path}")
-    print(f"Device: {device}")
-    print(f"Max samples: {max_samples if max_samples else 'All'}")
+    print(f"GPUs: {gpu_ids if gpu_ids else 'CPU'}")
+    print(f"Device map: {device_map}")
+    print(f"Max samples per task: {max_samples if max_samples else 'All'}")
+    print(f"Tasks: {', '.join(tasks_to_run)}")
+    print(f"Output directory: {output_dir}")
     print()
     
     # Load tokenizer
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
-        local_files_only=True  # Model is local, no need to download
+        local_files_only=True
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Load datasets
-    print("\nLoading datasets...")
-    rte_dataset = load_rte_dataset(dataset_cache_dir)
-    print(f"Loaded RTE: {len(rte_dataset)} validation samples")
+    # Load all datasets
+    print("\n" + "=" * 80)
+    print("LOADING DATASETS")
+    print("=" * 80)
     
-    boolq_dataset = load_boolq_dataset(dataset_cache_dir)
-    print(f"Loaded BoolQ: {len(boolq_dataset)} validation samples")
-    print()
+    timer.start('load_datasets')
+    datasets = {}
+    
+    if "rte" in tasks_to_run:
+        datasets["rte"] = load_rte_dataset(dataset_cache_dir)
+        print(f"  RTE: {len(datasets['rte'])} samples")
+    
+    if "boolq" in tasks_to_run:
+        datasets["boolq"] = load_boolq_dataset(dataset_cache_dir)
+        print(f"  BoolQ: {len(datasets['boolq'])} samples")
+    
+    if "winogrande" in tasks_to_run:
+        datasets["winogrande"] = load_winogrande_dataset(dataset_cache_dir)
+        print(f"  WinoGrande: {len(datasets['winogrande'])} samples")
+    
+    if "arc_easy" in tasks_to_run:
+        datasets["arc_easy"] = load_arc_easy_dataset(dataset_cache_dir)
+        print(f"  ARC-Easy: {len(datasets['arc_easy'])} samples")
+    
+    if "arc_challenge" in tasks_to_run:
+        datasets["arc_challenge"] = load_arc_challenge_dataset(dataset_cache_dir)
+        print(f"  ARC-Challenge: {len(datasets['arc_challenge'])} samples")
+    
+    if "openbookqa" in tasks_to_run:
+        datasets["openbookqa"] = load_openbookqa_dataset(dataset_cache_dir)
+        print(f"  OpenBookQA: {len(datasets['openbookqa'])} samples")
+    
+    if "piqa" in tasks_to_run:
+        datasets["piqa"] = load_piqa_dataset(dataset_cache_dir)
+        print(f"  PIQA: {len(datasets['piqa'])} samples")
+    
+    if "mmlu" in tasks_to_run:
+        datasets["mmlu"] = load_mmlu_dataset(dataset_cache_dir)
+        print(f"  MMLU: {len(datasets['mmlu'])} samples")
+    
+    if "longbench" in tasks_to_run:
+        datasets["longbench"] = load_longbench_dataset(dataset_cache_dir, task="qasper")
+        print(f"  LongBench (qasper): {len(datasets['longbench'])} samples")
+    
+    timer.stop('load_datasets')
+    print(f"\nDatasets loaded in {timer.format_time(timer.get('load_datasets'))}")
     
     # ========================================================================
     # Evaluate Original Model
     # ========================================================================
-    print("-" * 70)
-    print("Loading and evaluating ORIGINAL model...")
-    print("-" * 70)
+    print("\n" + "=" * 80)
+    print("EVALUATING ORIGINAL MODEL")
+    print("=" * 80)
     
+    timer.start('load_original_model')
     original_model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.float16,
-        device_map={"": gpu_id} if gpu_id >= 0 else "cpu",  # Load entirely to selected GPU
-        local_files_only=True  # Model is local, no need to download
+        device_map=device_map,
+        local_files_only=True
     )
+    timer.stop('load_original_model')
     
     layer_counts = count_linear_layers(original_model)
     print(f"Original model layer counts: {layer_counts}")
+    print(f"Model loaded in {timer.format_time(timer.get('load_original_model'))}")
     
-    # Evaluate on RTE
-    original_rte_results = evaluate_rte_zero_shot(
+    original_results = evaluate_all_tasks(
         original_model,
         tokenizer,
-        rte_dataset,
-        device=device,
-        max_samples=max_samples
+        datasets,
+        device=primary_device,
+        max_samples=max_samples,
+        timer=timer,
+        prefix="original_"
     )
-    print(f"\nOriginal Model RTE Results:")
-    print(f"  Accuracy: {original_rte_results['accuracy']:.4f} ({original_rte_results['correct']}/{original_rte_results['total']})")
-    
-    # Evaluate on BoolQ
-    original_boolq_results = evaluate_boolq_zero_shot(
-        original_model,
-        tokenizer,
-        boolq_dataset,
-        device=device,
-        max_samples=max_samples
-    )
-    print(f"\nOriginal Model BoolQ Results:")
-    print(f"  Accuracy: {original_boolq_results['accuracy']:.4f} ({original_boolq_results['correct']}/{original_boolq_results['total']})")
     
     # Free up memory
     del original_model
@@ -693,95 +1621,88 @@ def main():
     # ========================================================================
     # Evaluate Sparse Activation Model
     # ========================================================================
-    print()
-    print("-" * 70)
-    print("Loading and evaluating 2:4 SPARSE ACTIVATION model...")
-    print("-" * 70)
+    print("\n" + "=" * 80)
+    print("EVALUATING 2:4 SPARSE ACTIVATION MODEL")
+    print("=" * 80)
     
-    # Load model again
+    timer.start('load_sparse_model')
     sparse_model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.float16,
-        device_map={"": gpu_id} if gpu_id >= 0 else "cpu",  # Load entirely to selected GPU
-        local_files_only=True  # Model is local, no need to download
+        device_map=device_map,
+        local_files_only=True
     )
     
-    # Replace Linear layers with SparseActivationLinear
     print("Replacing Linear layers with SparseActivationLinear...")
     sparse_model = replace_linear_with_sparse(sparse_model)
+    timer.stop('load_sparse_model')
     
     layer_counts = count_linear_layers(sparse_model)
     print(f"Sparse model layer counts: {layer_counts}")
+    print(f"Sparse model loaded and converted in {timer.format_time(timer.get('load_sparse_model'))}")
     
-    # Evaluate on RTE
-    sparse_rte_results = evaluate_rte_zero_shot(
+    sparse_results = evaluate_all_tasks(
         sparse_model,
         tokenizer,
-        rte_dataset,
-        device=device,
-        max_samples=max_samples
+        datasets,
+        device=primary_device,
+        max_samples=max_samples,
+        timer=timer,
+        prefix="sparse_"
     )
-    print(f"\nSparse Activation Model RTE Results:")
-    print(f"  Accuracy: {sparse_rte_results['accuracy']:.4f} ({sparse_rte_results['correct']}/{sparse_rte_results['total']})")
     
-    # Evaluate on BoolQ
-    sparse_boolq_results = evaluate_boolq_zero_shot(
-        sparse_model,
-        tokenizer,
-        boolq_dataset,
-        device=device,
-        max_samples=max_samples
-    )
-    print(f"\nSparse Activation Model BoolQ Results:")
-    print(f"  Accuracy: {sparse_boolq_results['accuracy']:.4f} ({sparse_boolq_results['correct']}/{sparse_boolq_results['total']})")
+    # Stop total timer
+    timer.stop('total')
     
     # ========================================================================
-    # Comparison Summary
+    # Results Summary
     # ========================================================================
-    print()
-    print("=" * 70)
-    print("COMPARISON SUMMARY")
-    print("=" * 70)
+    print_results_table(original_results, sparse_results, tasks_to_run, timer)
     
-    # RTE Results
-    print("\n[RTE Task]")
-    print(f"{'Model':<30} {'Accuracy':<15} {'Correct/Total':<15}")
-    print("-" * 70)
-    print(f"{'Original':<30} {original_rte_results['accuracy']:<15.4f} {original_rte_results['correct']}/{original_rte_results['total']}")
-    print(f"{'2:4 Sparse Activation':<30} {sparse_rte_results['accuracy']:<15.4f} {sparse_rte_results['correct']}/{sparse_rte_results['total']}")
-    rte_diff = sparse_rte_results['accuracy'] - original_rte_results['accuracy']
-    print(f"Accuracy Difference: {rte_diff:+.4f} ({rte_diff*100:+.2f}%)")
+    # ========================================================================
+    # Save Results and Visualization
+    # ========================================================================
+    print("\n" + "=" * 80)
+    print("SAVING RESULTS")
+    print("=" * 80)
     
-    # BoolQ Results
-    print("\n[BoolQ Task]")
-    print(f"{'Model':<30} {'Accuracy':<15} {'Correct/Total':<15}")
-    print("-" * 70)
-    print(f"{'Original':<30} {original_boolq_results['accuracy']:<15.4f} {original_boolq_results['correct']}/{original_boolq_results['total']}")
-    print(f"{'2:4 Sparse Activation':<30} {sparse_boolq_results['accuracy']:<15.4f} {sparse_boolq_results['correct']}/{sparse_boolq_results['total']}")
-    boolq_diff = sparse_boolq_results['accuracy'] - original_boolq_results['accuracy']
-    print(f"Accuracy Difference: {boolq_diff:+.4f} ({boolq_diff*100:+.2f}%)")
+    # Prepare results for saving
+    all_results = {
+        'original': original_results,
+        'sparse': sparse_results
+    }
     
-    # Overall Summary
-    print("\n" + "=" * 70)
-    print("OVERALL SUMMARY")
-    print("=" * 70)
-    print(f"{'Task':<15} {'Original':<15} {'Sparse':<15} {'Difference':<15}")
-    print("-" * 70)
-    print(f"{'RTE':<15} {original_rte_results['accuracy']:<15.4f} {sparse_rte_results['accuracy']:<15.4f} {rte_diff:+.4f}")
-    print(f"{'BoolQ':<15} {original_boolq_results['accuracy']:<15.4f} {sparse_boolq_results['accuracy']:<15.4f} {boolq_diff:+.4f}")
+    # Save JSON results
+    json_path = save_results_to_json(all_results, timer.times, config, output_dir)
     
-    avg_original = (original_rte_results['accuracy'] + original_boolq_results['accuracy']) / 2
-    avg_sparse = (sparse_rte_results['accuracy'] + sparse_boolq_results['accuracy']) / 2
-    avg_diff = avg_sparse - avg_original
-    print("-" * 70)
-    print(f"{'Average':<15} {avg_original:<15.4f} {avg_sparse:<15.4f} {avg_diff:+.4f}")
-    print()
+    # Create visualization
+    viz_path = create_visualization(all_results, timer.times, output_dir)
+    
+    # ========================================================================
+    # Final Summary
+    # ========================================================================
+    print("\n" + "=" * 80)
+    print("EVALUATION COMPLETE")
+    print("=" * 80)
+    
+    num_tasks = len([t for t in tasks_to_run if t in original_results])
+    avg_orig = sum(original_results[t]['accuracy'] for t in original_results) / num_tasks if num_tasks > 0 else 0
+    avg_sparse = sum(sparse_results[t]['accuracy'] for t in sparse_results) / num_tasks if num_tasks > 0 else 0
+    
+    print(f"\nSummary:")
+    print(f"  Tasks evaluated: {num_tasks}")
+    print(f"  GPUs used: {gpu_ids if gpu_ids else 'CPU'}")
+    print(f"  Average Original Accuracy: {avg_orig*100:.2f}%")
+    print(f"  Average Sparse Accuracy:   {avg_sparse*100:.2f}%")
+    print(f"  Average Difference:        {(avg_sparse-avg_orig)*100:+.2f}%")
+    print(f"  Total Time: {timer.format_time(timer.get('total'))}")
+    print(f"\nResults saved to: {output_dir}/")
     
     # Clean up
     del sparse_model
     torch.cuda.empty_cache()
     
-    print("Evaluation complete!")
+    print("\nDone!")
     
 
 if __name__ == "__main__":

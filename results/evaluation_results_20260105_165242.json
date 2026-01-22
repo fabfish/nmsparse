@@ -1,0 +1,143 @@
+{
+  "timestamp": "2026-01-05T16:52:42.095995",
+  "config": {
+    "model_path": "/data/models/Llama-3.1-8B-Instruct",
+    "dataset_cache_dir": "/data/datasets/",
+    "max_samples": null,
+    "tasks": [
+      "rte",
+      "boolq",
+      "winogrande",
+      "arc_easy",
+      "arc_challenge",
+      "openbookqa",
+      "piqa",
+      "mmlu",
+      "longbench"
+    ],
+    "gpu_ids": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "device_map": "auto",
+    "timestamp": "2026-01-05T16:32:47.026925"
+  },
+  "results": {
+    "original": {
+      "rte": {
+        "accuracy": 0.8086642599277978,
+        "correct": 224,
+        "total": 277,
+        "time": 14.638493537902832
+      },
+      "boolq": {
+        "accuracy": 0.8535168195718654,
+        "correct": 2791,
+        "total": 3270,
+        "time": 167.86757493019104
+      },
+      "winogrande": {
+        "accuracy": 0.505130228887135,
+        "correct": 640,
+        "total": 1267,
+        "time": 30.9314181804657
+      },
+      "arc_easy": {
+        "accuracy": 0.8947368421052632,
+        "correct": 510,
+        "total": 570,
+        "time": 13.889341115951538
+      },
+      "arc_challenge": {
+        "accuracy": 0.7525083612040134,
+        "correct": 225,
+        "total": 299,
+        "time": 7.311344861984253
+      },
+      "openbookqa": {
+        "accuracy": 0.744,
+        "correct": 372,
+        "total": 500,
+        "time": 12.194011211395264
+      },
+      "mmlu": {
+        "accuracy": 0.581319399085565,
+        "correct": 890,
+        "total": 1531,
+        "time": 39.238850593566895
+      }
+    },
+    "sparse": {
+      "rte": {
+        "accuracy": 0.6425992779783394,
+        "correct": 178,
+        "total": 277,
+        "time": 32.498542070388794
+      },
+      "boolq": {
+        "accuracy": 0.6795107033639144,
+        "correct": 2222,
+        "total": 3270,
+        "time": 599.0315186977386
+      },
+      "winogrande": {
+        "accuracy": 0.48539857932123126,
+        "correct": 615,
+        "total": 1267,
+        "time": 70.23996949195862
+      },
+      "arc_easy": {
+        "accuracy": 0.37719298245614036,
+        "correct": 215,
+        "total": 570,
+        "time": 30.404017448425293
+      },
+      "arc_challenge": {
+        "accuracy": 0.3110367892976589,
+        "correct": 93,
+        "total": 299,
+        "time": 17.148101568222046
+      },
+      "openbookqa": {
+        "accuracy": 0.338,
+        "correct": 169,
+        "total": 500,
+        "time": 24.036222219467163
+      },
+      "mmlu": {
+        "accuracy": 0.30960156760287394,
+        "correct": 474,
+        "total": 1531,
+        "time": 119.71318936347961
+      }
+    }
+  },
+  "timing": {
+    "load_datasets": 2.13039231300354,
+    "load_original_model": 7.117210865020752,
+    "original_rte": 14.638493537902832,
+    "original_boolq": 167.86757493019104,
+    "original_winogrande": 30.9314181804657,
+    "original_arc_easy": 13.889341115951538,
+    "original_arc_challenge": 7.311344861984253,
+    "original_openbookqa": 12.194011211395264,
+    "original_mmlu": 39.238850593566895,
+    "load_sparse_model": 6.389216184616089,
+    "sparse_rte": 32.498542070388794,
+    "sparse_boolq": 599.0315186977386,
+    "sparse_winogrande": 70.23996949195862,
+    "sparse_arc_easy": 30.404017448425293,
+    "sparse_arc_challenge": 17.148101568222046,
+    "sparse_openbookqa": 24.036222219467163,
+    "sparse_mmlu": 119.71318936347961,
+    "total": 1195.4048917293549
+  },
+  "summary": {
+    "num_tasks": 7,
+    "avg_original_accuracy": 0.73426798725452,
+    "avg_sparse_accuracy": 0.4490485571457369,
+    "avg_difference": -0.2852194301087832
+  }
+}

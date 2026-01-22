@@ -215,6 +215,28 @@ def replace_linear_with_sparse(
     return model
 
 
+def list_linear_layers(model: nn.Module) -> Dict[str, List[str]]:
+    """
+    List all Linear and SparseActivationLinear layer names in the model.
+    
+    Args:
+        model: The model to analyze
+        
+    Returns:
+        Dictionary with lists of layer names
+    """
+    linear_names = []
+    sparse_names = []
+    
+    for name, module in model.named_modules():
+        if isinstance(module, SparseActivationLinear):
+            sparse_names.append(name)
+        elif isinstance(module, nn.Linear):
+            linear_names.append(name)
+    
+    return {'linear': linear_names, 'sparse_activation_linear': sparse_names}
+
+
 def count_linear_layers(model: nn.Module) -> Dict[str, int]:
     """
     Count the number of Linear and SparseActivationLinear layers.
@@ -1449,11 +1471,24 @@ def print_results_table(
 def main():
     """Main function to run the comparison experiment."""
     
+    # ========================================================================
     # Configuration
+    # ========================================================================
     model_path = "/data/models/Llama-3.1-8B-Instruct"
     dataset_cache_dir = "/data/datasets/"
     output_dir = "results"
     max_samples = None  # Set to a number for quick testing, None for full evaluation
+    
+    # GPU Configuration
+    # Option 1: Specify which GPUs to use (e.g., [1, 2, 3] to use GPUs 1, 2, 3)
+    # Option 2: Set to None to auto-detect all available GPUs
+    use_gpus = [1, 2, 3]  # Set to None for auto-detect, or specify GPU IDs like [1, 2, 3]
+    
+    # GPUs to exclude (e.g., [0] to exclude GPU 0 which is being used by someone else)
+    exclude_gpus = [0]  # GPUs to never use
+    
+    # Minimum free memory (MB) required for a GPU to be considered available
+    min_free_memory_mb = 20000
     
     # Tasks to evaluate (comment out tasks you don't want to run)
     tasks_to_run = [
@@ -1476,34 +1511,65 @@ def main():
     # GPU Detection and Multi-GPU Setup
     # ========================================================================
     print("\n" + "=" * 80)
-    print("MULTI-GPU DETECTION")
+    print("MULTI-GPU DETECTION AND CONFIGURATION")
     print("=" * 80)
     
     if torch.cuda.is_available():
-        available_gpus = get_available_gpus(min_free_memory_mb=20000)
         all_gpus = get_all_gpu_info()
+        print(f"\nTotal GPUs detected: {len(all_gpus)}")
         
-        print(f"\nTotal GPUs: {len(all_gpus)}")
-        print(f"Available GPUs (>20GB free): {available_gpus}")
+        # Get GPUs with sufficient free memory
+        available_gpus = get_available_gpus(min_free_memory_mb=min_free_memory_mb)
+        print(f"GPUs with >{min_free_memory_mb}MB free: {available_gpus}")
         
-        if len(available_gpus) >= 2:
-            # Use multiple GPUs
-            gpu_ids = available_gpus[:min(4, len(available_gpus))]  # Use up to 4 GPUs
-            print(f"Using multiple GPUs: {gpu_ids}")
-            device_map = "auto"  # Let HuggingFace distribute across available GPUs
+        # Apply exclusion list
+        if exclude_gpus:
+            available_gpus = [g for g in available_gpus if g not in exclude_gpus]
+            print(f"After excluding {exclude_gpus}: {available_gpus}")
+        
+        # Apply user-specified GPU list if provided
+        if use_gpus is not None:
+            # Filter to only use specified GPUs that are also available
+            gpu_ids = [g for g in use_gpus if g in available_gpus]
+            if not gpu_ids:
+                print(f"Warning: None of specified GPUs {use_gpus} are available. Using all available GPUs.")
+                gpu_ids = available_gpus
+            else:
+                print(f"Using specified GPUs (filtered by availability): {gpu_ids}")
+        else:
+            # Auto-detect: use all available GPUs
+            gpu_ids = available_gpus
+            print(f"Auto-detected available GPUs: {gpu_ids}")
+        
+        if not gpu_ids:
+            print("ERROR: No available GPUs found! Check GPU memory or exclusion settings.")
+            return
+        
+        # Setup device map for multi-GPU using max_memory to control which GPUs to use
+        if len(gpu_ids) >= 2:
+            # Multi-GPU: use max_memory to specify which GPUs can be used
+            # This is more reliable than CUDA_VISIBLE_DEVICES after torch import
+            max_memory = {i: "90GiB" for i in gpu_ids}  # Allow up to 90GB per GPU
+            max_memory["cpu"] = "30GiB"  # Fallback to CPU if needed
+            
+            device_map = "auto"  # Let accelerate distribute across specified GPUs
             primary_device = f"cuda:{gpu_ids[0]}"
+            print(f"Using {len(gpu_ids)} GPUs: {gpu_ids}")
+            print(f"Max memory config: {max_memory}")
         else:
             # Single GPU
-            gpu_id = available_gpus[0] if available_gpus else 0
-            gpu_ids = [gpu_id]
+            gpu_id = gpu_ids[0]
+            max_memory = {gpu_id: "90GiB", "cpu": "30GiB"}
             device_map = {"": gpu_id}
             primary_device = f"cuda:{gpu_id}"
+            print(f"Using single GPU: {gpu_id}")
         
         print_gpu_info(gpu_ids)
     else:
         gpu_ids = []
         device_map = "cpu"
         primary_device = "cpu"
+        max_memory = None
         print("CUDA not available. Using CPU.")
     
     # Configuration for model loading
@@ -1513,6 +1579,8 @@ def main():
         "max_samples": max_samples,
         "tasks": tasks_to_run,
         "gpu_ids": gpu_ids,
+        "excluded_gpus": exclude_gpus,
+        "specified_gpus": use_gpus,
         "device_map": str(device_map),
         "timestamp": datetime.now().isoformat()
     }
@@ -1521,7 +1589,9 @@ def main():
     print("EVALUATION CONFIGURATION")
     print("=" * 80)
     print(f"Model: {model_path}")
-    print(f"GPUs: {gpu_ids if gpu_ids else 'CPU'}")
+    print(f"Specified GPUs: {use_gpus if use_gpus else 'Auto-detect'}")
+    print(f"Excluded GPUs: {exclude_gpus}")
+    print(f"Final GPUs to use: {gpu_ids if gpu_ids else 'CPU'}")
     print(f"Device map: {device_map}")
     print(f"Max samples per task: {max_samples if max_samples else 'All'}")
     print(f"Tasks: {', '.join(tasks_to_run)}")
@@ -1537,52 +1607,80 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Load all datasets
+    # Load all datasets with error handling
     print("\n" + "=" * 80)
     print("LOADING DATASETS")
     print("=" * 80)
     
     timer.start('load_datasets')
     datasets = {}
+    skipped_tasks = []
+    
+    def safe_load_dataset(name: str, loader_func, *args, **kwargs):
+        """Safely load a dataset, return None if failed."""
+        try:
+            data = loader_func(*args, **kwargs)
+            print(f"  ✓ {name}: {len(data)} samples")
+            return data
+        except Exception as e:
+            print(f"  ✗ {name}: Failed to load - {str(e)[:100]}")
+            skipped_tasks.append(name)
+            return None
     
     if "rte" in tasks_to_run:
-        datasets["rte"] = load_rte_dataset(dataset_cache_dir)
-        print(f"  RTE: {len(datasets['rte'])} samples")
+        data = safe_load_dataset("RTE", load_rte_dataset, dataset_cache_dir)
+        if data is not None:
+            datasets["rte"] = data
     
     if "boolq" in tasks_to_run:
-        datasets["boolq"] = load_boolq_dataset(dataset_cache_dir)
-        print(f"  BoolQ: {len(datasets['boolq'])} samples")
+        data = safe_load_dataset("BoolQ", load_boolq_dataset, dataset_cache_dir)
+        if data is not None:
+            datasets["boolq"] = data
     
     if "winogrande" in tasks_to_run:
-        datasets["winogrande"] = load_winogrande_dataset(dataset_cache_dir)
-        print(f"  WinoGrande: {len(datasets['winogrande'])} samples")
+        data = safe_load_dataset("WinoGrande", load_winogrande_dataset, dataset_cache_dir)
+        if data is not None:
+            datasets["winogrande"] = data
     
     if "arc_easy" in tasks_to_run:
-        datasets["arc_easy"] = load_arc_easy_dataset(dataset_cache_dir)
-        print(f"  ARC-Easy: {len(datasets['arc_easy'])} samples")
+        data = safe_load_dataset("ARC-Easy", load_arc_easy_dataset, dataset_cache_dir)
+        if data is not None:
+            datasets["arc_easy"] = data
     
     if "arc_challenge" in tasks_to_run:
-        datasets["arc_challenge"] = load_arc_challenge_dataset(dataset_cache_dir)
-        print(f"  ARC-Challenge: {len(datasets['arc_challenge'])} samples")
+        data = safe_load_dataset("ARC-Challenge", load_arc_challenge_dataset, dataset_cache_dir)
+        if data is not None:
+            datasets["arc_challenge"] = data
     
     if "openbookqa" in tasks_to_run:
-        datasets["openbookqa"] = load_openbookqa_dataset(dataset_cache_dir)
-        print(f"  OpenBookQA: {len(datasets['openbookqa'])} samples")
+        data = safe_load_dataset("OpenBookQA", load_openbookqa_dataset, dataset_cache_dir)
+        if data is not None:
+            datasets["openbookqa"] = data
     
     if "piqa" in tasks_to_run:
-        datasets["piqa"] = load_piqa_dataset(dataset_cache_dir)
-        print(f"  PIQA: {len(datasets['piqa'])} samples")
+        data = safe_load_dataset("PIQA", load_piqa_dataset, dataset_cache_dir)
+        if data is not None:
+            datasets["piqa"] = data
     
     if "mmlu" in tasks_to_run:
-        datasets["mmlu"] = load_mmlu_dataset(dataset_cache_dir)
-        print(f"  MMLU: {len(datasets['mmlu'])} samples")
+        data = safe_load_dataset("MMLU", load_mmlu_dataset, dataset_cache_dir)
+        if data is not None:
+            datasets["mmlu"] = data
     
     if "longbench" in tasks_to_run:
-        datasets["longbench"] = load_longbench_dataset(dataset_cache_dir, task="qasper")
-        print(f"  LongBench (qasper): {len(datasets['longbench'])} samples")
+        data = safe_load_dataset("LongBench (qasper)", load_longbench_dataset, dataset_cache_dir, task="qasper")
+        if data is not None:
+            datasets["longbench"] = data
     
     timer.stop('load_datasets')
     print(f"\nDatasets loaded in {timer.format_time(timer.get('load_datasets'))}")
+    print(f"Successfully loaded: {len(datasets)} datasets")
+    if skipped_tasks:
+        print(f"Skipped (failed to load): {skipped_tasks}")
+    
+    if not datasets:
+        print("\nERROR: No datasets were successfully loaded. Exiting.")
+        return
     
     # ========================================================================
     # Evaluate Original Model
@@ -1592,12 +1690,16 @@ def main():
     print("=" * 80)
     
     timer.start('load_original_model')
-    original_model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.float16,
-        device_map=device_map,
-        local_files_only=True
-    )
+    load_kwargs = {
+        "torch_dtype": torch.float16,
+        "device_map": device_map,
+        "local_files_only": True
+    }
+    # Add max_memory for multi-GPU distribution
+    if max_memory is not None:
+        load_kwargs["max_memory"] = max_memory
+    
+    original_model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
     timer.stop('load_original_model')
     
     layer_counts = count_linear_layers(original_model)
@@ -1626,19 +1728,31 @@ def main():
     print("=" * 80)
     
     timer.start('load_sparse_model')
-    sparse_model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.float16,
-        device_map=device_map,
-        local_files_only=True
-    )
+    sparse_model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
     
-    print("Replacing Linear layers with SparseActivationLinear...")
+    # Debug: print all Linear layers before replacement
+    print("\nLinear layers before replacement:")
+    before_layers = list_linear_layers(sparse_model)
+    print(f"  Total Linear layers: {len(before_layers['linear'])}")
+    if len(before_layers['linear']) <= 20:
+        for name in before_layers['linear']:
+            print(f"    - {name}")
+    else:
+        print(f"    First 10: {before_layers['linear'][:10]}")
+        print(f"    Last 10: {before_layers['linear'][-10:]}")
+    
+    print("\nReplacing Linear layers with SparseActivationLinear...")
     sparse_model = replace_linear_with_sparse(sparse_model)
     timer.stop('load_sparse_model')
     
+    # Debug: print remaining Linear layers after replacement
     layer_counts = count_linear_layers(sparse_model)
-    print(f"Sparse model layer counts: {layer_counts}")
+    after_layers = list_linear_layers(sparse_model)
+    print(f"\nLinear layers after replacement (not replaced):")
+    for name in after_layers['linear']:
+        print(f"    - {name}")
+    
+    print(f"\nSparse model layer counts: {layer_counts}")
     print(f"Sparse model loaded and converted in {timer.format_time(timer.get('load_sparse_model'))}")
     
     sparse_results = evaluate_all_tasks(

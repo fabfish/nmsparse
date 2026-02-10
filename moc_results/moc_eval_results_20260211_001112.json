@@ -1,0 +1,173 @@
+{
+  "timestamp": "2026-02-11T00:11:12.772820",
+  "config": {
+    "model_path": "/data/models/Llama-3.1-8B-Instruct",
+    "cache_dir": "/data/datasets/",
+    "max_samples": null,
+    "tasks": [
+      "rte",
+      "boolq",
+      "winogrande",
+      "arc_easy",
+      "arc_challenge",
+      "openbookqa",
+      "piqa",
+      "mmlu",
+      "longbench"
+    ],
+    "gpu_ids": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "moc_channels": 2048,
+    "timestamp": "2026-02-10T23:35:05.523335"
+  },
+  "results": {
+    "original": {
+      "rte": {
+        "accuracy": 0.8122743682310469,
+        "correct": 225,
+        "total": 277,
+        "time": 23.602870225906372
+      },
+      "boolq": {
+        "accuracy": 0.8535168195718654,
+        "correct": 2791,
+        "total": 3270,
+        "time": 303.1370937824249
+      },
+      "winogrande": {
+        "accuracy": 0.505130228887135,
+        "correct": 640,
+        "total": 1267,
+        "time": 48.49202919006348
+      },
+      "arc_easy": {
+        "accuracy": 0.8929824561403509,
+        "correct": 509,
+        "total": 570,
+        "time": 21.830077409744263
+      },
+      "arc_challenge": {
+        "accuracy": 0.7525083612040134,
+        "correct": 225,
+        "total": 299,
+        "time": 11.540050268173218
+      },
+      "openbookqa": {
+        "accuracy": 0.742,
+        "correct": 371,
+        "total": 500,
+        "time": 18.914074420928955
+      },
+      "piqa": {
+        "accuracy": 0.6474428726877041,
+        "correct": 1190,
+        "total": 1838,
+        "time": 73.07467341423035
+      },
+      "mmlu": {
+        "accuracy": 0.5800130633572829,
+        "correct": 888,
+        "total": 1531,
+        "time": 67.86874890327454
+      },
+      "longbench": {
+        "accuracy": 0.08679030409309853,
+        "f1_score": 0.08679030409309853,
+        "correct": 17,
+        "total": 200,
+        "time": 389.8361461162567
+      }
+    },
+    "moc": {
+      "rte": {
+        "accuracy": 0.4620938628158845,
+        "correct": 128,
+        "total": 277,
+        "time": 24.654886960983276
+      },
+      "boolq": {
+        "accuracy": 0.41162079510703364,
+        "correct": 1346,
+        "total": 3270,
+        "time": 334.67079758644104
+      },
+      "winogrande": {
+        "accuracy": 0.5130228887134964,
+        "correct": 650,
+        "total": 1267,
+        "time": 53.611926317214966
+      },
+      "arc_easy": {
+        "accuracy": 0.24912280701754386,
+        "correct": 142,
+        "total": 570,
+        "time": 24.11771869659424
+      },
+      "arc_challenge": {
+        "accuracy": 0.22742474916387959,
+        "correct": 68,
+        "total": 299,
+        "time": 12.725165843963623
+      },
+      "openbookqa": {
+        "accuracy": 0.22,
+        "correct": 110,
+        "total": 500,
+        "time": 20.94148874282837
+      },
+      "piqa": {
+        "accuracy": 0.4972796517954298,
+        "correct": 914,
+        "total": 1838,
+        "time": 80.69272303581238
+      },
+      "mmlu": {
+        "accuracy": 0.24297844546048333,
+        "correct": 372,
+        "total": 1531,
+        "time": 74.99952340126038
+      },
+      "longbench": {
+        "accuracy": 0.0,
+        "f1_score": 0.0,
+        "correct": 0,
+        "total": 200,
+        "time": 416.93752241134644
+      }
+    }
+  },
+  "timing": {
+    "original_rte": 23.602870225906372,
+    "original_boolq": 303.1370937824249,
+    "original_winogrande": 48.49202919006348,
+    "original_arc_easy": 21.830077409744263,
+    "original_arc_challenge": 11.540050268173218,
+    "original_openbookqa": 18.914074420928955,
+    "original_piqa": 73.07467341423035,
+    "original_mmlu": 67.86874890327454,
+    "original_longbench": 389.8361461162567,
+    "moc_rte": 24.654886960983276,
+    "moc_boolq": 334.67079758644104,
+    "moc_winogrande": 53.611926317214966,
+    "moc_arc_easy": 24.11771869659424,
+    "moc_arc_challenge": 12.725165843963623,
+    "moc_openbookqa": 20.94148874282837,
+    "moc_piqa": 80.69272303581238,
+    "moc_mmlu": 74.99952340126038,
+    "moc_longbench": 416.93752241134644,
+    "total": 2020.029483795166
+  },
+  "summary": {
+    "num_tasks": 9,
+    "avg_original_accuracy": 0.6525176082413887,
+    "avg_moc_accuracy": 0.3137270222304168,
+    "avg_difference": -0.3387905860109719
+  }
+}

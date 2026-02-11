@@ -26,6 +26,7 @@ Usage:
 """
 
 import os
+import sys
 import json
 import copy
 import time
@@ -64,7 +65,8 @@ if hf_token:
     os.environ["HF_TOKEN"] = hf_token
 
 from transformers import (
-    AutoModelForCausalLM, 
+    AutoConfig,
+    AutoModelForCausalLM,
     AutoTokenizer,
     TrainingArguments,
     Trainer,
@@ -85,7 +87,7 @@ class MoCConfig:
         self,
         hidden_size: int = 4096,
         intermediate_size: int = 14336,
-        num_channels: int = 2048,  # used only for topk
+        num_channels: int = 3584,  # used for topk (default 25% of 14336)
         use_gradient_checkpointing: bool = True,
         training_mode: bool = False,
         sparsity_pattern: str = "topk",  # "topk" | "2:4" | "2:8"
@@ -345,13 +347,11 @@ def count_moc_layers(model: nn.Module) -> Dict[str, int]:
 
 
 # ============================================================================
-# 2:4 Semi-Structured Sparsity (same as test_rte_sparsity.py baseline)
+# Activation sparsity: 2:4, 2:8, topk (for sparse_all / sparse_ffn)
 # ============================================================================
 
 def apply_2_4_sparsity(x: torch.Tensor) -> torch.Tensor:
-    """
-    Apply 2:4 semi-structured sparsity: keep top-2 of every 4 elements by magnitude.
-    """
+    """Keep top-2 of every 4 elements by magnitude."""
     original_shape = x.shape
     last_dim = original_shape[-1]
     if last_dim % 4 != 0:
@@ -371,31 +371,71 @@ def apply_2_4_sparsity(x: torch.Tensor) -> torch.Tensor:
     return sparse_x
 
 
+def apply_2_8_sparsity(x: torch.Tensor) -> torch.Tensor:
+    """Keep top-2 of every 8 elements by magnitude."""
+    last_dim = x.shape[-1]
+    if last_dim % 8 != 0:
+        pad_size = 8 - (last_dim % 8)
+        x = F.pad(x, (0, pad_size), mode="constant", value=0)
+        padded = True
+    else:
+        padded = False
+    new_shape = x.shape[:-1] + (x.shape[-1] // 8, 8)
+    x_reshaped = x.view(new_shape)
+    _, top2_indices = x_reshaped.abs().topk(k=2, dim=-1)
+    mask = torch.zeros_like(x_reshaped)
+    mask.scatter_(-1, top2_indices, 1.0)
+    sparse_x = (x_reshaped * mask).view(x.shape)
+    if padded:
+        sparse_x = sparse_x[..., :last_dim]
+    return sparse_x
+
+
+def apply_topk_activation_sparsity(x: torch.Tensor, k: int) -> torch.Tensor:
+    """Keep top-k elements by magnitude along last dimension."""
+    dim = x.shape[-1]
+    k = min(k, dim)
+    _, idx = x.abs().topk(k, dim=-1, sorted=False)
+    mask = torch.zeros_like(x)
+    mask.scatter_(-1, idx, 1.0)
+    return x * mask
+
+
 class SparseActivationLinear(nn.Module):
-    """Linear wrapper that applies 2:4 sparsity to input activations (same as baseline)."""
-    def __init__(self, original_linear: nn.Linear):
+    """Linear wrapper that applies activation sparsity: pattern '2:4' | '2:8' | 'topk' (topk_ratio for topk)."""
+    def __init__(self, original_linear: nn.Linear, pattern: str = "2:4", topk_ratio: float = 0.5):
         super().__init__()
         self.in_features = original_linear.in_features
         self.out_features = original_linear.out_features
         self.weight = original_linear.weight
         self.bias = original_linear.bias
+        self.pattern = pattern
+        self.topk_ratio = topk_ratio  # for pattern "topk": keep in_features * topk_ratio
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        sparse_x = apply_2_4_sparsity(x)
+        if self.pattern == "2:4":
+            sparse_x = apply_2_4_sparsity(x)
+        elif self.pattern == "2:8":
+            sparse_x = apply_2_8_sparsity(x)
+        else:  # topk
+            k = max(1, int(x.shape[-1] * self.topk_ratio))
+            sparse_x = apply_topk_activation_sparsity(x, k)
         return F.linear(sparse_x, self.weight, self.bias)
 
 
 def replace_linear_with_sparse(
     model: nn.Module,
-    exclude_names: Optional[List[str]] = None
+    exclude_names: Optional[List[str]] = None,
+    pattern: str = "2:4",
+    topk_ratio: float = 0.5,
 ) -> nn.Module:
-    """Replace nn.Linear with SparseActivationLinear (exclude lm_head, embed)."""
+    """Replace nn.Linear with SparseActivationLinear (exclude lm_head, embed). pattern: 2:4 | 2:8 | topk."""
     if exclude_names is None:
         exclude_names = ["lm_head", "embed"]
 
     def should_replace(name: str) -> bool:
-        for pattern in exclude_names:
-            if pattern in name:
+        for p in exclude_names:
+            if p in name:
                 return False
         return True
 
@@ -403,7 +443,7 @@ def replace_linear_with_sparse(
         for name, child in list(module.named_children()):
             full_name = f"{prefix}.{name}" if prefix else name
             if isinstance(child, nn.Linear) and should_replace(full_name):
-                setattr(module, name, SparseActivationLinear(child))
+                setattr(module, name, SparseActivationLinear(child, pattern=pattern, topk_ratio=topk_ratio))
             else:
                 replace_recursive(child, full_name)
 
@@ -411,15 +451,19 @@ def replace_linear_with_sparse(
     return model
 
 
-def replace_linear_with_sparse_ffn_only(model: nn.Module) -> nn.Module:
-    """Replace only FFN Linear layers (gate_proj, up_proj, down_proj under .mlp) with SparseActivationLinear."""
+def replace_linear_with_sparse_ffn_only(
+    model: nn.Module,
+    pattern: str = "2:4",
+    topk_ratio: float = 0.5,
+) -> nn.Module:
+    """Replace only FFN Linear layers with SparseActivationLinear. pattern: 2:4 | 2:8 | topk."""
     def replace_recursive(module: nn.Module, prefix: str = "") -> None:
         for name, child in list(module.named_children()):
             full_name = f"{prefix}.{name}" if prefix else name
             if isinstance(child, nn.Linear) and "mlp" in full_name and (
                 "gate_proj" in full_name or "up_proj" in full_name or "down_proj" in full_name
             ):
-                setattr(module, name, SparseActivationLinear(child))
+                setattr(module, name, SparseActivationLinear(child, pattern=pattern, topk_ratio=topk_ratio))
             else:
                 replace_recursive(child, full_name)
     replace_recursive(model)
@@ -427,43 +471,81 @@ def replace_linear_with_sparse_ffn_only(model: nn.Module) -> nn.Module:
 
 
 # ============================================================================
-# Sparsity logic table: pattern (topk, 2:4, 2:8) x method (base, raw, raw_ffn, moc, moc+raw)
+# Sparsity logic table: pattern (topk, topk_50, 2:4, 2:8) x method (base, sparse_all, sparse_ffn, moc, moc+sparse)
 # ============================================================================
 
-# Variant id -> (description, apply_raw_all, apply_raw_ffn_only, moc_pattern or None)
+# topk default: 25% of inter (e.g. K=3584 for 14336); topk_50: 50% channels
+def _moc_topk_sparsity_str(num_channels: int, intermediate_size: int) -> str:
+    pct = 100.0 * num_channels / intermediate_size if intermediate_size else 0
+    return f"K={num_channels} ({pct:.1f}%)"
+
 SPARSITY_LOGIC_TABLE: Dict[str, Dict[str, Any]] = {
-    "original":     {"desc": "Base (no sparsity)",           "raw_all": False, "raw_ffn": False, "moc_pattern": None},
-    "raw":          {"desc": "Raw 2:4 (all linears)",        "raw_all": True,  "raw_ffn": False, "moc_pattern": None},
-    "raw_ffn":      {"desc": "Raw 2:4 (FFN linears only)",   "raw_all": False, "raw_ffn": True,  "moc_pattern": None},
-    "moc_topk":     {"desc": "MoC Top-K (FFN only)",        "raw_all": False, "raw_ffn": False, "moc_pattern": "topk"},
-    "moc_2_4":      {"desc": "MoC 2:4 block (FFN only)",     "raw_all": False, "raw_ffn": False, "moc_pattern": "2:4"},
-    "moc_2_8":      {"desc": "MoC 2:8 block (FFN only)",     "raw_all": False, "raw_ffn": False, "moc_pattern": "2:8"},
-    "moc_topk_raw": {"desc": "MoC Top-K + Raw 2:4 all",     "raw_all": True,  "raw_ffn": False, "moc_pattern": "topk"},
-    "moc_2_4_raw":  {"desc": "MoC 2:4 + Raw 2:4 all",       "raw_all": True,  "raw_ffn": False, "moc_pattern": "2:4"},
-    "moc_2_8_raw":  {"desc": "MoC 2:8 + Raw 2:4 all",      "raw_all": True,  "raw_ffn": False, "moc_pattern": "2:8"},
+    "original":          {"desc": "Base (no sparsity)",              "sparse_all": False, "sparse_ffn": False, "sparse_pattern": None, "sparse_topk_ratio": None, "moc_pattern": None, "moc_topk_ratio": None},
+    "sparse_all_topk":    {"desc": "sparse_all Top-K 25%",            "sparse_all": True,  "sparse_ffn": False, "sparse_pattern": "topk", "sparse_topk_ratio": 0.25, "moc_pattern": None, "moc_topk_ratio": None},
+    "sparse_all_topk_50": {"desc": "sparse_all Top-K 50%",            "sparse_all": True,  "sparse_ffn": False, "sparse_pattern": "topk", "sparse_topk_ratio": 0.5,  "moc_pattern": None, "moc_topk_ratio": None},
+    "sparse_all_2_4":     {"desc": "sparse_all 2:4",                  "sparse_all": True,  "sparse_ffn": False, "sparse_pattern": "2:4",  "sparse_topk_ratio": None, "moc_pattern": None, "moc_topk_ratio": None},
+    "sparse_all_2_8":     {"desc": "sparse_all 2:8",                  "sparse_all": True,  "sparse_ffn": False, "sparse_pattern": "2:8",  "sparse_topk_ratio": None, "moc_pattern": None, "moc_topk_ratio": None},
+    "sparse_ffn_topk":    {"desc": "sparse_ffn Top-K 25%",            "sparse_all": False, "sparse_ffn": True,  "sparse_pattern": "topk", "sparse_topk_ratio": 0.25, "moc_pattern": None, "moc_topk_ratio": None},
+    "sparse_ffn_topk_50": {"desc": "sparse_ffn Top-K 50%",            "sparse_all": False, "sparse_ffn": True,  "sparse_pattern": "topk", "sparse_topk_ratio": 0.5,  "moc_pattern": None, "moc_topk_ratio": None},
+    "sparse_ffn_2_4":    {"desc": "sparse_ffn 2:4",                  "sparse_all": False, "sparse_ffn": True,  "sparse_pattern": "2:4",  "sparse_topk_ratio": None, "moc_pattern": None, "moc_topk_ratio": None},
+    "sparse_ffn_2_8":    {"desc": "sparse_ffn 2:8",                  "sparse_all": False, "sparse_ffn": True,  "sparse_pattern": "2:8",  "sparse_topk_ratio": None, "moc_pattern": None, "moc_topk_ratio": None},
+    "moc_topk":           {"desc": "MoC Top-K 25% (FFN)",             "sparse_all": False, "sparse_ffn": False, "sparse_pattern": None, "sparse_topk_ratio": None, "moc_pattern": "topk", "moc_topk_ratio": 0.25},
+    "moc_topk_50":        {"desc": "MoC Top-K 50% (FFN)",             "sparse_all": False, "sparse_ffn": False, "sparse_pattern": None, "sparse_topk_ratio": None, "moc_pattern": "topk", "moc_topk_ratio": 0.5},
+    "moc_2_4":            {"desc": "MoC 2:4 (FFN)",                  "sparse_all": False, "sparse_ffn": False, "sparse_pattern": None, "sparse_topk_ratio": None, "moc_pattern": "2:4", "moc_topk_ratio": None},
+    "moc_2_8":            {"desc": "MoC 2:8 (FFN)",                  "sparse_all": False, "sparse_ffn": False, "sparse_pattern": None, "sparse_topk_ratio": None, "moc_pattern": "2:8", "moc_topk_ratio": None},
+    "moc_topk_sparse":    {"desc": "MoC Top-K 25% + sparse_all",     "sparse_all": True,  "sparse_ffn": False, "sparse_pattern": "2:4", "sparse_topk_ratio": None, "moc_pattern": "topk", "moc_topk_ratio": 0.25},
+    "moc_topk_50_sparse": {"desc": "MoC Top-K 50% + sparse_all",     "sparse_all": True,  "sparse_ffn": False, "sparse_pattern": "2:4", "sparse_topk_ratio": None, "moc_pattern": "topk", "moc_topk_ratio": 0.5},
+    "moc_2_4_sparse":     {"desc": "MoC 2:4 + sparse_all",           "sparse_all": True,  "sparse_ffn": False, "sparse_pattern": "2:4", "sparse_topk_ratio": None, "moc_pattern": "2:4", "moc_topk_ratio": None},
+    "moc_2_8_sparse":     {"desc": "MoC 2:8 + sparse_all",           "sparse_all": True,  "sparse_ffn": False, "sparse_pattern": "2:4", "sparse_topk_ratio": None, "moc_pattern": "2:8", "moc_topk_ratio": None},
 }
 VARIANT_KEYS = list(SPARSITY_LOGIC_TABLE.keys())
 
+# Short column labels so table fits one line (e.g. 80-col terminal)
+VARIANT_SHORT_LABELS = {
+    "original": "Orig",
+    "sparse_all_topk": "S_T25",
+    "sparse_all_topk_50": "S_T50",
+    "sparse_all_2_4": "S_24",
+    "sparse_all_2_8": "S_28",
+    "sparse_ffn_topk": "F_T25",
+    "sparse_ffn_topk_50": "F_T50",
+    "sparse_ffn_2_4": "F_24",
+    "sparse_ffn_2_8": "F_28",
+    "moc_topk": "MoC_T25",
+    "moc_topk_50": "MoC_T50",
+    "moc_2_4": "MoC_24",
+    "moc_2_8": "MoC_28",
+    "moc_topk_sparse": "T25+S",
+    "moc_topk_50_sparse": "T50+S",
+    "moc_2_4_sparse": "24+S",
+    "moc_2_8_sparse": "28+S",
+}
 
-def print_sparsity_logic_table() -> None:
-    """Print the logic table: sparsity pattern (topk, 2:4, 2:8) vs method (base, raw, raw_ffn, moc, moc+raw)."""
-    print("\n" + "=" * 100)
+
+def print_sparsity_logic_table(intermediate_size: int = 14336, num_channels: int = None) -> None:
+    """Print logic table: pattern x method. For Top-K show sparsity (K and %)."""
+    if num_channels is None:
+        num_channels = (intermediate_size * 25) // 100  # 25% default
+    k50 = (intermediate_size * 50) // 100
+    topk_str = _moc_topk_sparsity_str(num_channels, intermediate_size)
+    topk50_str = _moc_topk_sparsity_str(k50, intermediate_size)
+    print("\n" + "=" * 110)
     print("SPARSITY LOGIC TABLE (pattern x method → variant)")
-    print("=" * 100)
-    print("\n  Rows = sparsity pattern in FFN. Cols = where sparsity is applied.")
-    print("  base = no sparsity; raw = 2:4 activation on all linears; raw_ffn = 2:4 on FFN linears only;")
-    print("  moc = MoC (pattern) in FFN only; moc+raw = raw (all) + MoC (pattern) in FFN.")
+    print("=" * 110)
+    print("\n  Cols: base | sparse_all (activation sparsity on all linears) | sparse_ffn (FFN linears only) | moc (FFN only) | moc+sparse (sparse_all + MoC).")
+    print("  Rows: pattern. Top-K sparsity: " + topk_str + "; other: " + topk50_str + ".")
     print()
-    # Grid: row = pattern, col = method; cell = variant id or "-"
-    print(f"  {'Pattern':<10} | {'base':<12} | {'raw (2:4 all)':<14} | {'raw_ffn':<10} | {'moc (FFN)':<12} | {'moc+raw':<12}")
-    print("  " + "-" * 90)
-    print(f"  {'(none)':<10} | {'original':<12} | {'-':<14} | {'-':<10} | {'-':<12} | {'-':<12}")
-    print(f"  {'Top-K':<10} | {'-':<12} | {'-':<14} | {'-':<10} | {'moc_topk':<12} | {'moc_topk_raw':<12}")
-    print(f"  {'2:4':<10} | {'-':<12} | {'raw':<14} | {'raw_ffn':<10} | {'moc_2_4':<12} | {'moc_2_4_raw':<12}")
-    print(f"  {'2:8':<10} | {'-':<12} | {'-':<14} | {'-':<10} | {'moc_2_8':<12} | {'moc_2_8_raw':<12}")
-    print("  " + "-" * 90)
-    print("\n  Variants run in eval:", VARIANT_KEYS)
-    print("=" * 100 + "\n")
+    print(f"  {'Pattern':<14} | {'base':<12} | {'sparse_all':<18} | {'sparse_ffn':<18} | {'moc (FFN)':<16} | {'moc+sparse':<16}")
+    print("  " + "-" * 110)
+    print(f"  {'(none)':<14} | {'original':<12} | {'-':<18} | {'-':<18} | {'-':<16} | {'-':<16}")
+    print(f"  {'Top-K 25%':<14} | {'-':<12} | {'sparse_all_topk':<18} | {'sparse_ffn_topk':<18} | {'moc_topk':<16} | {'moc_topk_sparse':<16}")
+    print(f"  {'Top-K 50%':<14} | {'-':<12} | {'sparse_all_topk_50':<18} | {'sparse_ffn_topk_50':<18} | {'moc_topk_50':<16} | {'moc_topk_50_sparse':<16}")
+    print(f"  {'2:4':<14} | {'-':<12} | {'sparse_all_2_4':<18} | {'sparse_ffn_2_4':<18} | {'moc_2_4':<16} | {'moc_2_4_sparse':<16}")
+    print(f"  {'2:8':<14} | {'-':<12} | {'sparse_all_2_8':<18} | {'sparse_ffn_2_8':<18} | {'moc_2_8':<16} | {'moc_2_8_sparse':<16}")
+    print("  " + "-" * 110)
+    print("\n  Top-K sparsity (MoC / sparse): default " + topk_str + "; other " + topk50_str + ".")
+    print("  Variants run in eval:", VARIANT_KEYS)
+    print("=" * 110 + "\n")
 
 
 # ============================================================================
@@ -1041,6 +1123,14 @@ class Timer:
     def get(self, name: str) -> float:
         return self.times.get(name, 0.0)
 
+    def get_elapsed(self, name: str) -> float:
+        """Current elapsed time (if still running) or stored time (if stopped)."""
+        if name in self.times:
+            return self.times[name]
+        if name in self.start_times:
+            return time.time() - self.start_times[name]
+        return 0.0
+
     def format_time(self, seconds: float) -> str:
         if seconds < 60:
             return f"{seconds:.1f}s"
@@ -1098,25 +1188,43 @@ def evaluate_all_tasks(
     return results
 
 
+# ANSI: highlight new result (green bold); no-op if not a tty
+def _hl(s: str, on: bool = True) -> str:
+    if not on:
+        return s
+    return f"\033[1;32m{s}\033[0m"
+
+
 def print_results_table(
     results_by_variant: Dict[str, Dict[str, Dict[str, float]]],
     tasks_to_run: List[str],
-    timer: Timer
+    timer: Timer,
+    highlight_variant: Optional[str] = None,
 ) -> None:
-    """Print detailed results table for all variants (pattern x method)."""
+    """Print results table; short labels so one line fits. Overall = current elapsed."""
     variants = [k for k in VARIANT_KEYS if k in results_by_variant]
     if not variants:
         return
-    print("\n" + "=" * 140)
-    print("DETAILED RESULTS TABLE (all sparsity variants)")
-    print("=" * 140)
-    header = f"\n{'Task':<12}"
+    use_color = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+    col_w = 7   # accuracy column width
+    time_w = 10 # time column (e.g. "5m 3.1s")
+    sep_w = 10 + len(variants) * (col_w + 1) + 8
+    sep_w = min(sep_w, 120)
+    print("\n" + "=" * sep_w)
+    title = "RESULTS"
+    if highlight_variant:
+        title += " [*new]"
+    print(title)
+    print("=" * sep_w)
+    header = f"{'Task':<10}"
     for v in variants:
-        label = SPARSITY_LOGIC_TABLE.get(v, {}).get("desc", v)[:14]
-        header += f" {label:<14}"
-    header += " Samples"
+        label = VARIANT_SHORT_LABELS.get(v, v[:col_w])
+        if v == highlight_variant:
+            label = label + "*"
+        header += f" {label:<{col_w}}"
+    header += " N"
     print(header)
-    print("-" * 140)
+    print("-" * sep_w)
     totals = {v: {"acc": 0.0, "time": 0.0} for v in variants}
     num_tasks = 0
     for task_name in tasks_to_run:
@@ -1133,23 +1241,39 @@ def print_results_table(
         if not ok:
             continue
         num_tasks += 1
-        line = f"{task_name:<12}"
-        for acc in row_vals:
-            line += f" {acc:<14.4f}"
-        line += f" {results_by_variant[variants[0]][task_name].get('total', ''):<8}"
+        line = f"{task_name:<10}"
+        for i, v in enumerate(variants):
+            acc_str = f"{row_vals[i]:<{col_w}.3f}"
+            if use_color and v == highlight_variant:
+                acc_str = _hl(acc_str, use_color)
+            line += f" {acc_str}"
+        line += f" {results_by_variant[variants[0]][task_name].get('total', ''):<6}"
         print(line)
-    print("-" * 140)
+    print("-" * sep_w)
     if num_tasks > 0:
-        line = f"{'AVERAGE':<12}"
+        line = f"{'AVG':<10}"
         for v in variants:
-            line += f" {totals[v]['acc']/num_tasks:<14.4f}"
+            avg_str = f"{totals[v]['acc']/num_tasks:<{col_w}.3f}"
+            if use_color and v == highlight_variant:
+                avg_str = _hl(avg_str, use_color)
+            line += f" {avg_str}"
         print(line)
-        time_line = "Time total  "
+        time_line = f"{'Time':<10}"
         for v in variants:
-            time_line += f" {timer.format_time(totals[v]['time']):<14}"
+            t_str = timer.format_time(totals[v]["time"])
+            if use_color and v == highlight_variant:
+                t_str = _hl(t_str, use_color)
+            time_line += f" {t_str:<{time_w}}"
         print(time_line)
-    print("=" * 140)
-    print(f"Overall: {timer.format_time(timer.get('total'))}")
+    print("=" * sep_w)
+    overall_elapsed = timer.get_elapsed("total")
+    print(f"Overall: {timer.format_time(overall_elapsed)}")
+    # One-line legend
+    legend = "Legend: Orig=base | S_*=sparse_all, F_*=sparse_ffn | MoC_*=MoC | *+S=MoC+sparse | T25/T50=TopK 25%/50%, 24/28=2:4 2:8"
+    if len(legend) <= sep_w:
+        print(legend)
+    else:
+        print("Legend: Orig S_* F_* MoC_* *+S T25 T50 24 28")
 
 
 def save_results_to_json(
@@ -1406,7 +1530,9 @@ def main():
     parser.add_argument("--tasks", nargs="+",
                         default=["rte", "boolq", "winogrande", "arc_easy", "arc_challenge", "openbookqa", "piqa", "mmlu", "longbench"],
                         help="Evaluation tasks (same as baseline test_rte_sparsity.py)")
-    parser.add_argument("--moc_channels", type=int, default=2048, help="MoC Top-K channels")
+    parser.add_argument("--quick_test", action="store_true",
+                        help="Quick test: only run tasks that typically finish in <30s (rte, arc_easy, arc_challenge, openbookqa)")
+    parser.add_argument("--moc_channels", type=int, default=None, help="MoC Top-K channels (default: 25%% of intermediate_size)")
     parser.add_argument("--max_samples", type=int, default=None, help="Max samples per task (None=all)")
     parser.add_argument("--output_dir", type=str, default="./moc_results")
     parser.add_argument("--use_lora", action="store_true", help="Use LoRA for finetune")
@@ -1417,12 +1543,14 @@ def main():
     # GPU (align with baseline)
     parser.add_argument("--use_gpus", nargs="*", type=int, default=None,
                         help="GPU IDs to use (e.g. 1 2 3). None=auto-detect.")
-    parser.add_argument("--exclude_gpus", nargs="*", type=int, default=[0],
-                        help="GPU IDs to exclude (default: 0)")
+    parser.add_argument("--exclude_gpus", nargs="*", type=int, default=None,
+                        help="GPU IDs to exclude (default: none; use all GPUs including 0). Example: --exclude_gpus 0")
     parser.add_argument("--min_free_memory_mb", type=int, default=20000)
 
     args = parser.parse_args()
-    tasks_to_run = args.tasks
+    tasks_to_run = ["rte", "arc_easy", "arc_challenge", "openbookqa"] if args.quick_test else args.tasks
+    if args.quick_test:
+        print("Quick test mode: only tasks with typical run time <30s (rte, arc_easy, arc_challenge, openbookqa).")
     os.makedirs(args.output_dir, exist_ok=True)
 
     # -------------------------------------------------------------------------
@@ -1545,14 +1673,18 @@ def main():
             print("No datasets loaded. Exiting.")
             return
 
-        print_sparsity_logic_table()
+        # Get model dimensions for logic table (Top-K sparsity display)
+        _config = AutoConfig.from_pretrained(args.model_path, local_files_only=True)
+        _intermediate_size = getattr(_config, "intermediate_size", 14336)
+        _num_channels = args.moc_channels if args.moc_channels is not None else ((getattr(_config, "intermediate_size", 14336) * 25) // 100)
+        print_sparsity_logic_table(intermediate_size=_intermediate_size, num_channels=_num_channels)
 
         timer = Timer()
         timer.start("total")
         all_results = {}
         hidden_size = None
         intermediate_size = None
-        num_channels = args.moc_channels
+        num_channels = args.moc_channels  # set below from intermediate_size if None
 
         for vid in VARIANT_KEYS:
             logic = SPARSITY_LOGIC_TABLE[vid]
@@ -1564,16 +1696,25 @@ def main():
                 hidden_size = model.config.hidden_size
                 intermediate_size = model.config.intermediate_size
                 if num_channels is None:
-                    num_channels = hidden_size // 2
-            if logic["raw_all"]:
-                replace_linear_with_sparse(model)
-            elif logic["raw_ffn"]:
-                replace_linear_with_sparse_ffn_only(model)
+                    num_channels = (intermediate_size * 25) // 100  # 25% default
+            if logic["sparse_all"]:
+                pat = logic.get("sparse_pattern") or "2:4"
+                ratio = logic.get("sparse_topk_ratio") if pat == "topk" else 0.5
+                replace_linear_with_sparse(model, pattern=pat, topk_ratio=ratio)
+            elif logic["sparse_ffn"]:
+                pat = logic.get("sparse_pattern") or "2:4"
+                ratio = logic.get("sparse_topk_ratio") if pat == "topk" else 0.5
+                replace_linear_with_sparse_ffn_only(model, pattern=pat, topk_ratio=ratio)
             if logic["moc_pattern"] is not None:
+                # moc_topk_ratio: 0.25 = 25%, 0.5 = 50%; None/1.0 = use num_channels
+                if logic["moc_pattern"] == "topk" and logic.get("moc_topk_ratio") is not None:
+                    moc_k = int(intermediate_size * logic["moc_topk_ratio"])
+                else:
+                    moc_k = num_channels
                 moc_config = MoCConfig(
                     hidden_size=hidden_size,
                     intermediate_size=intermediate_size,
-                    num_channels=num_channels,
+                    num_channels=moc_k,
                     training_mode=False,
                     use_gradient_checkpointing=True,
                     sparsity_pattern=logic["moc_pattern"],
@@ -1585,6 +1726,9 @@ def main():
             )
             del model
             torch.cuda.empty_cache()
+
+            # 每完成一组任务就打印现有结果，并高亮本组新结果
+            print_results_table(all_results, tasks_to_run, timer, highlight_variant=vid)
 
         timer.stop("total")
 
@@ -1610,7 +1754,7 @@ def main():
         model = AutoModelForCausalLM.from_pretrained(args.model_path, **load_kwargs)
         hidden_size = model.config.hidden_size
         intermediate_size = model.config.intermediate_size
-        num_channels = args.moc_channels or hidden_size // 2
+        num_channels = args.moc_channels or (model.config.intermediate_size * 25) // 100
         moc_config = MoCConfig(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,

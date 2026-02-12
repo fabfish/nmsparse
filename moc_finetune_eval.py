@@ -1200,9 +1200,11 @@ def print_results_table(
     tasks_to_run: List[str],
     timer: Timer,
     highlight_variant: Optional[str] = None,
+    variant_order: Optional[List[str]] = None,
 ) -> None:
     """Print results table; short labels so one line fits. Overall = current elapsed."""
-    variants = [k for k in VARIANT_KEYS if k in results_by_variant]
+    order = variant_order if variant_order is not None else VARIANT_KEYS
+    variants = [k for k in order if k in results_by_variant]
     if not variants:
         return
     use_color = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
@@ -1292,10 +1294,10 @@ def save_results_to_json(
         "timing": timing_info,
         "summary": {}
     }
-    tasks = list(results.get("original", {}).keys()) if "original" in results else []
+    tasks = list(results.get("original", {}).keys()) if "original" in results else list(next(iter(results.values()), {}).keys())
     if tasks:
         out["summary"] = {"num_tasks": len(tasks)}
-        for v in VARIANT_KEYS:
+        for v in (list(results.keys()) if results else []):
             if v in results and all(t in results[v] for t in tasks):
                 accs = [results[v][t]["accuracy"] for t in tasks]
                 out["summary"][f"avg_{v}_accuracy"] = sum(accs) / len(accs)
@@ -1322,8 +1324,8 @@ def create_visualization(
         return ""
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    tasks = list(results.get("original", {}).keys())
-    variants = [k for k in VARIANT_KEYS if k in results]
+    tasks = list(results.get("original", {}).keys()) if "original" in results else list(next(iter(results.values()), {}).keys())
+    variants = [k for k in VARIANT_KEYS if k in results] if any(k in VARIANT_KEYS for k in results) else list(results.keys())
     if not tasks or not variants:
         return ""
     labels = {v: SPARSITY_LOGIC_TABLE.get(v, {}).get("desc", v)[:12] for v in variants}
@@ -1394,8 +1396,84 @@ def create_visualization(
 
 
 # ============================================================================
-# Fine-tuning Functions
+# Fine-tuning Functions (incl. finetune_eval: only FFN trainable, then eval)
 # ============================================================================
+
+# Variants to run for finetune_eval: all F (sparse_ffn) + all MoC (moc only, no moc+sparse)
+FINETUNE_EVAL_VARIANTS = [
+    "sparse_ffn_topk",
+    "sparse_ffn_topk_50",
+    "sparse_ffn_2_4",
+    "sparse_ffn_2_8",
+    "moc_topk",
+    "moc_topk_50",
+    "moc_2_4",
+    "moc_2_8",
+]
+
+
+def freeze_all_except_ffn(model: nn.Module) -> None:
+    """Freeze all parameters except those in FFN (mlp). Only FFN is trainable."""
+    for name, param in model.named_parameters():
+        if "mlp" not in name:
+            param.requires_grad = False
+        else:
+            param.requires_grad = True
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in model.parameters())
+    print(f"  Trainable: {n_trainable:,} / {n_total:,} ({100.0 * n_trainable / n_total:.2f}%)")
+
+
+def build_model_for_variant(
+    model_path: str,
+    vid: str,
+    load_kwargs: Dict[str, Any],
+    hidden_size: int,
+    intermediate_size: int,
+    num_channels: Optional[int],
+    training_mode: bool = False,
+) -> nn.Module:
+    """Build model with the given variant (same logic as eval loop). training_mode=True for finetune."""
+    from transformers import AutoModelForCausalLM
+    model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+    logic = SPARSITY_LOGIC_TABLE[vid]
+    if logic["sparse_all"]:
+        pat = logic.get("sparse_pattern") or "2:4"
+        ratio = logic.get("sparse_topk_ratio") if pat == "topk" else 0.5
+        replace_linear_with_sparse(model, pattern=pat, topk_ratio=ratio)
+    elif logic["sparse_ffn"]:
+        pat = logic.get("sparse_pattern") or "2:4"
+        ratio = logic.get("sparse_topk_ratio") if pat == "topk" else 0.5
+        replace_linear_with_sparse_ffn_only(model, pattern=pat, topk_ratio=ratio)
+    if logic["moc_pattern"] is not None:
+        if logic["moc_pattern"] == "topk" and logic.get("moc_topk_ratio") is not None:
+            moc_k = int(intermediate_size * logic["moc_topk_ratio"])
+        else:
+            moc_k = num_channels or (intermediate_size * 25) // 100
+        moc_config = MoCConfig(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_channels=moc_k,
+            training_mode=training_mode,
+            use_gradient_checkpointing=True,
+            sparsity_pattern=logic["moc_pattern"],
+        )
+        replace_mlp_with_moc(model, moc_config)
+    return model
+
+
+def load_state_dict_from_checkpoint(ckpt_dir: str) -> Dict[str, torch.Tensor]:
+    """Load state dict from a saved checkpoint (safetensors or pytorch_model.bin)."""
+    import os
+    sf_path = os.path.join(ckpt_dir, "model.safetensors")
+    pt_path = os.path.join(ckpt_dir, "pytorch_model.bin")
+    if os.path.isfile(sf_path):
+        from safetensors.torch import load_file
+        return load_file(sf_path)
+    if os.path.isfile(pt_path):
+        return torch.load(pt_path, map_location="cpu", weights_only=True)
+    raise FileNotFoundError(f"No model.safetensors or pytorch_model.bin in {ckpt_dir}")
+
 
 def prepare_finetuning_data(
     dataset_name: str,
@@ -1455,6 +1533,19 @@ def prepare_finetuning_data(
     return tokenized_dataset
 
 
+class TrainerWithDeviceMap(Trainer):
+    """Trainer that moves labels to the output device when using device_map='auto' (multi-GPU).
+    Avoids 'Expected all tensors to be on the same device' in loss computation."""
+    def compute_loss(self, model, inputs, return_outputs=False):
+        if "labels" in inputs and hasattr(model, "lm_head"):
+            out_device = next(model.lm_head.parameters()).device
+            labels = inputs["labels"]
+            if labels is not None and labels.device != out_device:
+                inputs = dict(inputs)
+                inputs["labels"] = labels.to(out_device)
+        return super().compute_loss(model, inputs, return_outputs=return_outputs)
+
+
 def finetune_moc_model(
     model: nn.Module,
     tokenizer: Any,
@@ -1497,8 +1588,8 @@ def finetune_moc_model(
     # 数据整理器
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     
-    # 训练器
-    trainer = Trainer(
+    # 训练器（支持 device_map="auto" 多卡：labels 会搬到 logits 所在设备再算 loss）
+    trainer = TrainerWithDeviceMap(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -1523,8 +1614,8 @@ def finetune_moc_model(
 
 def main():
     parser = argparse.ArgumentParser(description="MoC Fine-tuning and Evaluation (baseline-style task process)")
-    parser.add_argument("--mode", choices=["eval", "finetune", "both"], default="eval",
-                        help="eval=Original vs MoC comparison; finetune=MoC+LoRA only; both=comparison then finetune")
+    parser.add_argument("--mode", choices=["eval", "finetune", "both", "finetune_eval"], default="eval",
+                        help="eval=Original vs variants; finetune=MoC+LoRA only; both=eval then finetune; finetune_eval=per-variant FFN-only finetune then full eval")
     parser.add_argument("--model_path", type=str, default="/data/models/Llama-3.1-8B-Instruct")
     parser.add_argument("--dataset", type=str, default="rte", help="Finetune dataset (rte, boolq)")
     parser.add_argument("--tasks", nargs="+",
@@ -1608,6 +1699,112 @@ def main():
     }
     if max_memory is not None:
         load_kwargs["max_memory"] = max_memory
+
+    # -------------------------------------------------------------------------
+    # Finetune-Eval: per-variant FFN-only finetune then full eval (F + MoC)
+    # -------------------------------------------------------------------------
+    if args.mode == "finetune_eval":
+        print("\n" + "=" * 80)
+        print("MODE: finetune_eval — FFN-only finetune then eval on trained task only")
+        print("Variants:", FINETUNE_EVAL_VARIANTS)
+        print("Train & Eval task:", args.dataset)
+        print("=" * 80)
+        # Only load the dataset used for training; eval only on that task
+        eval_task = args.dataset
+        datasets = {}
+        if eval_task == "rte":
+            d = load_rte_dataset(args.cache_dir)
+            if d is not None:
+                datasets["rte"] = d
+                print(f"  ✓ rte: {len(d) if hasattr(d, '__len__') else '?'} samples")
+        elif eval_task == "boolq":
+            d = load_boolq_dataset(args.cache_dir)
+            if d is not None:
+                datasets["boolq"] = d
+                print(f"  ✓ boolq: {len(d) if hasattr(d, '__len__') else '?'} samples")
+        else:
+            print(f"Unsupported --dataset for finetune_eval: {eval_task} (use rte or boolq).")
+            return
+
+        if not datasets:
+            print("No dataset loaded. Exiting.")
+            return
+        eval_tasks = [eval_task]
+
+        _config = AutoConfig.from_pretrained(args.model_path, local_files_only=True)
+        hidden_size = getattr(_config, "hidden_size", 4096)
+        intermediate_size = getattr(_config, "intermediate_size", 14336)
+        num_channels = args.moc_channels if args.moc_channels is not None else (intermediate_size * 25) // 100
+
+        config["finetune_eval"] = True
+        config["finetune_dataset"] = args.dataset
+        config["finetune_epochs"] = args.epochs
+        config["finetune_batch_size"] = args.batch_size
+        config["variants"] = FINETUNE_EVAL_VARIANTS
+
+        timer = Timer()
+        timer.start("total")
+        finetuned_results = {}
+
+        for vid in FINETUNE_EVAL_VARIANTS:
+            print("\n" + "=" * 80)
+            print(f"VARIANT: {vid} — build → freeze non-FFN → finetune → save")
+            print("=" * 80)
+            model = build_model_for_variant(
+                args.model_path, vid, load_kwargs,
+                hidden_size, intermediate_size, num_channels,
+                training_mode=True,
+            )
+            print(f"  Freezing all except FFN for {vid}...")
+            freeze_all_except_ffn(model)
+            out_dir = os.path.join(args.output_dir, f"finetuned_{vid}")
+            os.makedirs(out_dir, exist_ok=True)
+            finetune_moc_model(
+                model=model,
+                tokenizer=tokenizer,
+                dataset_name=args.dataset,
+                output_dir=out_dir,
+                num_epochs=args.epochs,
+                batch_size=args.batch_size,
+                cache_dir=args.cache_dir,
+            )
+            del model
+            torch.cuda.empty_cache()
+
+            print(f"\n--- Eval after finetune: {vid} ---")
+            model = build_model_for_variant(
+                args.model_path, vid, load_kwargs,
+                hidden_size, intermediate_size, num_channels,
+                training_mode=False,
+            )
+            ckpt_dir = os.path.join(out_dir, "final_model")
+            state = load_state_dict_from_checkpoint(ckpt_dir)
+            model.load_state_dict(state, strict=True)
+            model.eval()
+            finetuned_results[vid] = evaluate_all_tasks(
+                model, tokenizer, datasets,
+                device=primary_device, max_samples=args.max_samples, timer=timer, prefix=f"{vid}_"
+            )
+            del model
+            torch.cuda.empty_cache()
+
+        timer.stop("total")
+        print("\n" + "=" * 80)
+        print("FINETUNED EVAL RESULTS (trained task only:", eval_task, ")")
+        print("=" * 80)
+        print_results_table(finetuned_results, eval_tasks, timer, variant_order=FINETUNE_EVAL_VARIANTS)
+        save_results_to_json(finetuned_results, timer.times, config, args.output_dir)
+        create_visualization(finetuned_results, timer.times, args.output_dir)
+        num_tasks = len(eval_tasks)
+        if num_tasks > 0:
+            for v in FINETUNE_EVAL_VARIANTS:
+                if v in finetuned_results:
+                    task_accs = [finetuned_results[v][t]["accuracy"] for t in eval_tasks if t in finetuned_results[v]]
+                    avg = sum(task_accs) / len(task_accs) if task_accs else 0.0
+                    print(f"  Avg {v}: {avg*100:.2f}%")
+        print(f"Total time: {timer.format_time(timer.get('total'))}")
+        print("\nDone.")
+        return
 
     # -------------------------------------------------------------------------
     # Eval (and optionally both): host task process — Original vs MoC

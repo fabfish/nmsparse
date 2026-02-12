@@ -65,15 +65,70 @@ Baseline: `test_rte_sparsity.py` (Original vs 2:4 sparse). Full benchmark: `moc_
 
 ## Usage
 
+All commands use `moc_finetune_eval.py`. Default model: `Llama-3.1-8B-Instruct`, default data cache: `/data/datasets/`.
+
+### Eval only (zero-shot, no training)
+
 ```bash
-# Quick test (4 tasks, <30s each)
+# Quick test: 4 tasks (rte, arc_easy, arc_challenge, openbookqa)
 python moc_finetune_eval.py --mode eval --quick_test
 
-# Full eval (all tasks, all 17 variants)
+# Full eval: all 10 tasks, all 17 variants
 python moc_finetune_eval.py --mode eval
 
-# Optional: GPU selection
-python moc_finetune_eval.py --mode eval --use_gpus 0 1 --exclude_gpus 2
+# Custom model / tasks / GPU
+python moc_finetune_eval.py --mode eval \
+  --model_path /data/models/Llama-3.1-8B-Instruct \
+  --tasks rte boolq winogrande arc_easy arc_challenge openbookqa piqa mmlu longbench \
+  --use_gpus 0 1 --exclude_gpus 2
 ```
 
-See `moc_finetune_eval.py` for `--tasks`, `--moc_channels`, `--max_samples`, etc.
+### Finetune-eval (FFN-only finetune, then eval on the **trained task** only)
+
+Trains each of 8 variants (F + MoC) with **only FFN trainable**, then runs eval on the same task as `--dataset` (rte or boolq).
+
+```bash
+# Train on RTE, eval on RTE (default: 3 epochs, batch 4)
+python moc_finetune_eval.py --mode finetune_eval --dataset rte
+
+# Train on BoolQ, eval on BoolQ
+python moc_finetune_eval.py --mode finetune_eval --dataset boolq
+
+# Fewer epochs / custom output
+python moc_finetune_eval.py --mode finetune_eval --dataset rte --epochs 2 --output_dir ./my_moc_results
+```
+
+Checkpoints: `{output_dir}/finetuned_{variant}/final_model`. Results: same JSON/PNG in `output_dir` as eval.
+
+### Finetune only (single MoC model, no per-variant loop)
+
+```bash
+# MoC + optional LoRA on RTE
+python moc_finetune_eval.py --mode finetune --dataset rte --epochs 3
+python moc_finetune_eval.py --mode finetune --dataset rte --use_lora --lora_r 16
+```
+
+### Eval then finetune in one run
+
+```bash
+python moc_finetune_eval.py --mode both --dataset rte
+```
+
+### Common options
+
+| Option | Default | Description |
+|--------|---------|--------------|
+| `--mode` | eval | `eval` \| `finetune` \| `both` \| `finetune_eval` |
+| `--model_path` | /data/models/Llama-3.1-8B-Instruct | Base model path |
+| `--dataset` | rte | Finetune data: `rte` or `boolq` |
+| `--tasks` | (10 tasks) | Eval task list (eval/both only) |
+| `--quick_test` | false | Eval only 4 quick tasks |
+| `--output_dir` | ./moc_results | Results and finetuned checkpoints |
+| `--epochs` | 3 | Finetune epochs |
+| `--batch_size` | 4 | Finetune batch size |
+| `--cache_dir` | /data/datasets/ | Dataset cache |
+| `--use_gpus` | auto | GPU IDs, e.g. `0 1` |
+| `--exclude_gpus` | none | GPU IDs to exclude |
+| `--max_samples` | None | Cap samples per task (eval) |
+
+See `moc_finetune_eval.py --help` for `--moc_channels`, `--use_lora`, `--lora_r`, etc.

@@ -471,7 +471,174 @@ def replace_linear_with_sparse_ffn_only(
 
 
 # ============================================================================
-# Sparsity logic table: pattern (topk, topk_50, 2:4, 2:8) x method (base, sparse_all, sparse_ffn, moc, moc+sparse)
+# PRAC: Principal-Random Activation Compression (arXiv:2602.23111)
+#
+# Verified against paper (Li, Zhang, Fang 2026):
+# - Q1 via truncated SVD (top-r1 right singular vectors)  [Section 4.2]
+# - Q2 sampled uniformly from orth. complement of Q1      [Section 4.2]
+# - Reconstruction: X_hat = XQ1 Q1^T + k * XQ2 Q2^T      [Section 4.3]
+# - Scaling factor k = (n - r1) / r2  (unbiased, min-variance) [Thm + Fig 7]
+#
+# For zero-shot comparison with element-wise sparsity methods, PRAC's
+# compress->decompress pipeline is applied during the forward pass:
+#   x  ->  project to subspace  ->  reconstruct x_hat  ->  linear(x_hat)
+# ============================================================================
+
+class PRACCompressor:
+    """
+    PRAC activation compressor (self-contained, from prac/src/prac.py).
+
+    Algorithm:
+    1. SVD on activation X -> principal subspace Q1 (top-r1 right singular vectors)
+    2. Sample Q2 uniformly from the orthogonal complement of Q1 (via QR)
+    3. Compress: store XQ1 [B,S,r1] and XQ2 [B,S,r2]
+    4. Reconstruct: X_hat = XQ1 @ Q1^T + k * XQ2 @ Q2^T,  k = (n-r1)/r2
+    """
+
+    def __init__(self, feature_dim: int, principal_rank: float = 0.3,
+                 random_rank: float = 0.3, scaling_factor: Optional[float] = None,
+                 update_freq: int = 1000):
+        self.feature_dim = feature_dim
+        self.r1 = max(1, int(feature_dim * principal_rank))
+        self.r2 = max(1, int(feature_dim * random_rank))
+        self.k = scaling_factor if scaling_factor is not None else (feature_dim - self.r1) / self.r2
+        self.update_freq = update_freq
+        self.Q1: Optional[torch.Tensor] = None
+        self.Q2: Optional[torch.Tensor] = None
+        self.step_count = 0
+
+    def update_subspaces(self, activations: torch.Tensor) -> None:
+        should_update = (self.step_count % self.update_freq == 0
+                         or self.Q1 is None)
+        if should_update:
+            self._update_principal(activations)
+            self._update_random()
+        self.step_count += 1
+
+    def _update_principal(self, activations: torch.Tensor) -> None:
+        X = activations.reshape(-1, activations.shape[-1]) if activations.dim() == 3 else activations
+        orig_dtype = activations.dtype
+        try:
+            _, _, Vh = torch.linalg.svd(X.float(), full_matrices=False)
+            self.Q1 = Vh[:self.r1, :].T.contiguous().detach().to(orig_dtype)
+        except Exception:
+            Q = torch.randn(self.feature_dim, self.r1,
+                            device=activations.device, dtype=torch.float32)
+            self.Q1, _ = torch.linalg.qr(Q)
+            self.Q1 = self.Q1.to(orig_dtype)
+
+    def _update_random(self) -> None:
+        device, dtype = self.Q1.device, self.Q1.dtype
+        Q1f = self.Q1.float()
+        Z = torch.randn(self.feature_dim, self.r2, device=device, dtype=torch.float32)
+        Z = Z - Q1f @ (Q1f.T @ Z)
+        Q2f, _ = torch.linalg.qr(Z)
+        self.Q2 = Q2f.to(dtype)
+
+    def compress_decompress(self, x: torch.Tensor) -> torch.Tensor:
+        """Compress then immediately decompress: x -> x_hat (lossy round-trip)."""
+        if self.Q1 is None or self.Q2 is None:
+            self.update_subspaces(x)
+        Q1 = self.Q1.to(device=x.device, dtype=x.dtype)
+        Q2 = self.Q2.to(device=x.device, dtype=x.dtype)
+        XQ1 = x @ Q1
+        XQ2 = x @ Q2
+        return XQ1 @ Q1.T + self.k * (XQ2 @ Q2.T)
+
+    def retention_ratio(self) -> float:
+        return (self.r1 + self.r2) / self.feature_dim
+
+
+class PRACActivationLinear(nn.Module):
+    """Linear wrapper that applies PRAC subspace compression to input activations.
+
+    Analogous to SparseActivationLinear but uses principal+random subspace projection
+    instead of element-wise sparsity. Shares weights from the original linear (no copy).
+    """
+
+    def __init__(self, original_linear: nn.Linear, principal_rank: float = 0.25,
+                 random_rank: float = 0.25, update_freq: int = 1000,
+                 min_dim: int = 64):
+        super().__init__()
+        self.in_features = original_linear.in_features
+        self.out_features = original_linear.out_features
+        self.weight = original_linear.weight
+        self.bias = original_linear.bias
+        self.principal_rank = principal_rank
+        self.random_rank = random_rank
+        self.compressor: Optional[PRACCompressor] = None
+        if self.in_features >= min_dim:
+            self.compressor = PRACCompressor(
+                self.in_features, principal_rank, random_rank,
+                update_freq=update_freq,
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.compressor is not None:
+            with torch.no_grad():
+                self.compressor.update_subspaces(x.detach())
+            x = self.compressor.compress_decompress(x)
+        return F.linear(x, self.weight, self.bias)
+
+
+def replace_linear_with_prac(
+    model: nn.Module,
+    principal_rank: float = 0.25,
+    random_rank: float = 0.25,
+    exclude_names: Optional[List[str]] = None,
+    update_freq: int = 1000,
+    min_dim: int = 64,
+) -> nn.Module:
+    """Replace nn.Linear with PRACActivationLinear (exclude lm_head, embed)."""
+    if exclude_names is None:
+        exclude_names = ["lm_head", "embed"]
+
+    def should_replace(name: str) -> bool:
+        return not any(p in name for p in exclude_names)
+
+    def replace_recursive(module: nn.Module, prefix: str = "") -> None:
+        for name, child in list(module.named_children()):
+            full_name = f"{prefix}.{name}" if prefix else name
+            if isinstance(child, nn.Linear) and should_replace(full_name):
+                setattr(module, name, PRACActivationLinear(
+                    child, principal_rank, random_rank, update_freq, min_dim))
+            else:
+                replace_recursive(child, full_name)
+
+    replace_recursive(model)
+    n = sum(1 for m in model.modules() if isinstance(m, PRACActivationLinear))
+    print(f"Replaced {n} Linear layers with PRACActivationLinear "
+          f"(r1={principal_rank}, r2={random_rank}, retain {(principal_rank+random_rank)*100:.0f}%)")
+    return model
+
+
+def replace_linear_with_prac_ffn_only(
+    model: nn.Module,
+    principal_rank: float = 0.25,
+    random_rank: float = 0.25,
+    update_freq: int = 1000,
+    min_dim: int = 64,
+) -> nn.Module:
+    """Replace only FFN Linear layers (gate_proj, up_proj, down_proj) with PRACActivationLinear."""
+    def replace_recursive(module: nn.Module, prefix: str = "") -> None:
+        for name, child in list(module.named_children()):
+            full_name = f"{prefix}.{name}" if prefix else name
+            if (isinstance(child, nn.Linear) and "mlp" in full_name
+                    and any(k in full_name for k in ("gate_proj", "up_proj", "down_proj"))):
+                setattr(module, name, PRACActivationLinear(
+                    child, principal_rank, random_rank, update_freq, min_dim))
+            else:
+                replace_recursive(child, full_name)
+
+    replace_recursive(model)
+    n = sum(1 for m in model.modules() if isinstance(m, PRACActivationLinear))
+    print(f"Replaced {n} FFN Linear layers with PRACActivationLinear "
+          f"(r1={principal_rank}, r2={random_rank}, retain {(principal_rank+random_rank)*100:.0f}%)")
+    return model
+
+
+# ============================================================================
+# Sparsity logic table: pattern (topk, topk_50, 2:4, 2:8) x method (base, sparse_all, sparse_ffn, moc, moc+sparse, prac)
 # ============================================================================
 
 # topk default: 25% of inter (e.g. K=3584 for 14336); topk_50: 50% channels
@@ -497,6 +664,11 @@ SPARSITY_LOGIC_TABLE: Dict[str, Dict[str, Any]] = {
     "moc_topk_50_sparse": {"desc": "MoC Top-K 50% + sparse_all",     "sparse_all": True,  "sparse_ffn": False, "sparse_pattern": "2:4", "sparse_topk_ratio": None, "moc_pattern": "topk", "moc_topk_ratio": 0.5},
     "moc_2_4_sparse":     {"desc": "MoC 2:4 + sparse_all",           "sparse_all": True,  "sparse_ffn": False, "sparse_pattern": "2:4", "sparse_topk_ratio": None, "moc_pattern": "2:4", "moc_topk_ratio": None},
     "moc_2_8_sparse":     {"desc": "MoC 2:8 + sparse_all",           "sparse_all": True,  "sparse_ffn": False, "sparse_pattern": "2:4", "sparse_topk_ratio": None, "moc_pattern": "2:8", "moc_topk_ratio": None},
+    # PRAC variants (arXiv:2602.23111): principal+random subspace compression on activations
+    "prac_all_60":        {"desc": "PRAC all 60% retain",             "sparse_all": False, "sparse_ffn": False, "sparse_pattern": None, "sparse_topk_ratio": None, "moc_pattern": None, "moc_topk_ratio": None, "prac_all": True,  "prac_ffn": False, "prac_rank": 0.30},
+    "prac_all_50":        {"desc": "PRAC all 50% retain",             "sparse_all": False, "sparse_ffn": False, "sparse_pattern": None, "sparse_topk_ratio": None, "moc_pattern": None, "moc_topk_ratio": None, "prac_all": True,  "prac_ffn": False, "prac_rank": 0.25},
+    "prac_ffn_60":        {"desc": "PRAC FFN 60% retain",             "sparse_all": False, "sparse_ffn": False, "sparse_pattern": None, "sparse_topk_ratio": None, "moc_pattern": None, "moc_topk_ratio": None, "prac_all": False, "prac_ffn": True,  "prac_rank": 0.30},
+    "prac_ffn_50":        {"desc": "PRAC FFN 50% retain",             "sparse_all": False, "sparse_ffn": False, "sparse_pattern": None, "sparse_topk_ratio": None, "moc_pattern": None, "moc_topk_ratio": None, "prac_all": False, "prac_ffn": True,  "prac_rank": 0.25},
 }
 VARIANT_KEYS = list(SPARSITY_LOGIC_TABLE.keys())
 
@@ -519,6 +691,10 @@ VARIANT_SHORT_LABELS = {
     "moc_topk_50_sparse": "T50+S",
     "moc_2_4_sparse": "24+S",
     "moc_2_8_sparse": "28+S",
+    "prac_all_60": "P_60",
+    "prac_all_50": "P_50",
+    "prac_ffn_60": "PF_60",
+    "prac_ffn_50": "PF_50",
 }
 
 
@@ -529,23 +705,26 @@ def print_sparsity_logic_table(intermediate_size: int = 14336, num_channels: int
     k50 = (intermediate_size * 50) // 100
     topk_str = _moc_topk_sparsity_str(num_channels, intermediate_size)
     topk50_str = _moc_topk_sparsity_str(k50, intermediate_size)
-    print("\n" + "=" * 110)
+    print("\n" + "=" * 140)
     print("SPARSITY LOGIC TABLE (pattern x method → variant)")
-    print("=" * 110)
-    print("\n  Cols: base | sparse_all (activation sparsity on all linears) | sparse_ffn (FFN linears only) | moc (FFN only) | moc+sparse (sparse_all + MoC).")
+    print("=" * 140)
+    print("\n  Cols: base | sparse_all | sparse_ffn | moc (FFN) | moc+sparse | prac_all | prac_ffn")
     print("  Rows: pattern. Top-K sparsity: " + topk_str + "; other: " + topk50_str + ".")
     print()
-    print(f"  {'Pattern':<14} | {'base':<12} | {'sparse_all':<18} | {'sparse_ffn':<18} | {'moc (FFN)':<16} | {'moc+sparse':<16}")
-    print("  " + "-" * 110)
-    print(f"  {'(none)':<14} | {'original':<12} | {'-':<18} | {'-':<18} | {'-':<16} | {'-':<16}")
-    print(f"  {'Top-K 25%':<14} | {'-':<12} | {'sparse_all_topk':<18} | {'sparse_ffn_topk':<18} | {'moc_topk':<16} | {'moc_topk_sparse':<16}")
-    print(f"  {'Top-K 50%':<14} | {'-':<12} | {'sparse_all_topk_50':<18} | {'sparse_ffn_topk_50':<18} | {'moc_topk_50':<16} | {'moc_topk_50_sparse':<16}")
-    print(f"  {'2:4':<14} | {'-':<12} | {'sparse_all_2_4':<18} | {'sparse_ffn_2_4':<18} | {'moc_2_4':<16} | {'moc_2_4_sparse':<16}")
-    print(f"  {'2:8':<14} | {'-':<12} | {'sparse_all_2_8':<18} | {'sparse_ffn_2_8':<18} | {'moc_2_8':<16} | {'moc_2_8_sparse':<16}")
-    print("  " + "-" * 110)
+    print(f"  {'Pattern':<14} | {'base':<12} | {'sparse_all':<18} | {'sparse_ffn':<18} | {'moc (FFN)':<16} | {'moc+sparse':<16} | {'prac_all':<14} | {'prac_ffn':<14}")
+    print("  " + "-" * 140)
+    print(f"  {'(none)':<14} | {'original':<12} | {'-':<18} | {'-':<18} | {'-':<16} | {'-':<16} | {'-':<14} | {'-':<14}")
+    print(f"  {'Top-K 25%':<14} | {'-':<12} | {'sparse_all_topk':<18} | {'sparse_ffn_topk':<18} | {'moc_topk':<16} | {'moc_topk_sparse':<16} | {'-':<14} | {'-':<14}")
+    print(f"  {'Top-K 50%':<14} | {'-':<12} | {'sparse_all_topk_50':<18} | {'sparse_ffn_topk_50':<18} | {'moc_topk_50':<16} | {'moc_topk_50_sparse':<16} | {'-':<14} | {'-':<14}")
+    print(f"  {'2:4':<14} | {'-':<12} | {'sparse_all_2_4':<18} | {'sparse_ffn_2_4':<18} | {'moc_2_4':<16} | {'moc_2_4_sparse':<16} | {'-':<14} | {'-':<14}")
+    print(f"  {'2:8':<14} | {'-':<12} | {'sparse_all_2_8':<18} | {'sparse_ffn_2_8':<18} | {'moc_2_8':<16} | {'moc_2_8_sparse':<16} | {'-':<14} | {'-':<14}")
+    print(f"  {'PRAC 60%':<14} | {'-':<12} | {'-':<18} | {'-':<18} | {'-':<16} | {'-':<16} | {'prac_all_60':<14} | {'prac_ffn_60':<14}")
+    print(f"  {'PRAC 50%':<14} | {'-':<12} | {'-':<18} | {'-':<18} | {'-':<16} | {'-':<16} | {'prac_all_50':<14} | {'prac_ffn_50':<14}")
+    print("  " + "-" * 140)
     print("\n  Top-K sparsity (MoC / sparse): default " + topk_str + "; other " + topk50_str + ".")
+    print("  PRAC: principal+random subspace activation compression (arXiv:2602.23111). 60%=r1=r2=0.3, 50%=r1=r2=0.25.")
     print("  Variants run in eval:", VARIANT_KEYS)
-    print("=" * 110 + "\n")
+    print("=" * 140 + "\n")
 
 
 # ============================================================================
@@ -612,6 +791,32 @@ def load_dataset_from_local(cache_path: Path) -> List[Dict]:
         return json.load(f)
 
 
+def _try_load_from_disk(cache_dir: str, dataset_name: str, subset_name: Optional[str],
+                        split: str) -> Any:
+    """Try loading a dataset saved via save_to_disk under cache_dir."""
+    from datasets import load_from_disk
+    candidates = []
+    base = dataset_name.replace("/", "_")
+    if subset_name:
+        candidates.append(os.path.join(cache_dir, subset_name.lower().replace("-", "_")))
+        candidates.append(os.path.join(cache_dir, subset_name))
+        candidates.append(os.path.join(cache_dir, dataset_name.split("/")[-1], subset_name))
+        candidates.append(os.path.join(cache_dir, base, subset_name))
+    candidates.append(os.path.join(cache_dir, base))
+    candidates.append(os.path.join(cache_dir, dataset_name.split("/")[-1]))
+    for p in candidates:
+        if os.path.isdir(p) and os.path.exists(os.path.join(p, "dataset_dict.json")):
+            ds = load_from_disk(p)
+            if split in ds:
+                return ds[split]
+            if "test" in ds and split == "validation":
+                return ds["test"]
+            return ds[list(ds.keys())[0]]
+        if os.path.isdir(p) and os.path.exists(os.path.join(p, "dataset_info.json")):
+            return load_from_disk(p)
+    return None
+
+
 def load_dataset_with_cache(
     dataset_name: str,
     subset_name: Optional[str] = None,
@@ -670,13 +875,21 @@ def load_dataset_with_cache(
         return data
         
     except Exception as e:
+        if cache_dir:
+            disk_data = _try_load_from_disk(cache_dir, dataset_name, subset_name, split)
+            if disk_data is not None:
+                print(f"  Loaded {full_name} ({split}) from disk cache (load_from_disk fallback)")
+                return disk_data
         print(f"Error loading {full_name}: {e}")
         raise
 
 
-# Dataset-specific loaders (保持原有实现)
+# Dataset-specific loaders
 def load_rte_dataset(cache_dir: str = "/data/datasets/") -> Any:
-    return load_dataset_with_cache("glue", "rte", cache_dir, split="validation")
+    try:
+        return load_dataset_with_cache("glue", "rte", cache_dir, split="validation")
+    except Exception:
+        return load_dataset_with_cache("super_glue", "rte", cache_dir, split="validation")
 
 def load_boolq_dataset(cache_dir: str = "/data/datasets/") -> Any:
     return load_dataset_with_cache("super_glue", "boolq", cache_dir, split="validation")
@@ -860,7 +1073,9 @@ def evaluate_rte_zero_shot(model, tokenizer, dataset, device, max_samples=None):
     samples = _get_samples(dataset, max_samples)
 
     for sample in tqdm(samples, desc="RTE"):
-        prompt = create_rte_prompt(sample["sentence1"], sample["sentence2"])
+        s1 = sample.get("sentence1") or sample.get("premise", "")
+        s2 = sample.get("sentence2") or sample.get("hypothesis", "")
+        prompt = create_rte_prompt(s1, s2)
         yes_logprob = get_token_logprob(model, tokenizer, prompt, "Yes", device)
         no_logprob = get_token_logprob(model, tokenizer, prompt, "No", device)
         predicted = 0 if yes_logprob > no_logprob else 1
@@ -882,8 +1097,9 @@ def evaluate_boolq_zero_shot(model, tokenizer, dataset, device, max_samples=None
         yes_logprob = get_token_logprob(model, tokenizer, prompt, "Yes", device)
         no_logprob = get_token_logprob(model, tokenizer, prompt, "No", device)
         predicted = yes_logprob > no_logprob
+        label = sample.get("label", sample.get("answer"))
         
-        if predicted == sample["label"]:
+        if predicted == label:
             correct += 1
         total += 1
     
@@ -1270,12 +1486,11 @@ def print_results_table(
     print("=" * sep_w)
     overall_elapsed = timer.get_elapsed("total")
     print(f"Overall: {timer.format_time(overall_elapsed)}")
-    # One-line legend
-    legend = "Legend: Orig=base | S_*=sparse_all, F_*=sparse_ffn | MoC_*=MoC | *+S=MoC+sparse | T25/T50=TopK 25%/50%, 24/28=2:4 2:8"
+    legend = "Legend: Orig=base | S_*=sparse_all, F_*=sparse_ffn | MoC_*=MoC | *+S=MoC+sparse | P_*=PRAC_all, PF_*=PRAC_ffn | T25/T50=TopK, 24/28=2:4/2:8"
     if len(legend) <= sep_w:
         print(legend)
     else:
-        print("Legend: Orig S_* F_* MoC_* *+S T25 T50 24 28")
+        print("Legend: Orig S_* F_* MoC_* *+S P_* PF_* T25 T50 24 28")
 
 
 def save_results_to_json(
@@ -1459,6 +1674,12 @@ def build_model_for_variant(
             sparsity_pattern=logic["moc_pattern"],
         )
         replace_mlp_with_moc(model, moc_config)
+    prac_rank = logic.get("prac_rank")
+    if prac_rank is not None:
+        if logic.get("prac_all"):
+            replace_linear_with_prac(model, principal_rank=prac_rank, random_rank=prac_rank)
+        elif logic.get("prac_ffn"):
+            replace_linear_with_prac_ffn_only(model, principal_rank=prac_rank, random_rank=prac_rank)
     return model
 
 
@@ -1637,6 +1858,8 @@ def main():
     parser.add_argument("--exclude_gpus", nargs="*", type=int, default=None,
                         help="GPU IDs to exclude (default: none; use all GPUs including 0). Example: --exclude_gpus 0")
     parser.add_argument("--min_free_memory_mb", type=int, default=20000)
+    parser.add_argument("--variants", nargs="*", default=None,
+                        help="Variant keys to run (e.g. original prac_all_50). None=all variants.")
 
     args = parser.parse_args()
     tasks_to_run = ["rte", "arc_easy", "arc_challenge", "openbookqa"] if args.quick_test else args.tasks
@@ -1883,7 +2106,11 @@ def main():
         intermediate_size = None
         num_channels = args.moc_channels  # set below from intermediate_size if None
 
-        for vid in VARIANT_KEYS:
+        variants_to_run = args.variants if args.variants else VARIANT_KEYS
+        for vid in variants_to_run:
+            if vid not in SPARSITY_LOGIC_TABLE:
+                print(f"WARNING: unknown variant '{vid}', skipping.")
+                continue
             logic = SPARSITY_LOGIC_TABLE[vid]
             print("\n" + "=" * 80)
             print(f"EVALUATING: {logic['desc']} ({vid})")
@@ -1917,6 +2144,12 @@ def main():
                     sparsity_pattern=logic["moc_pattern"],
                 )
                 replace_mlp_with_moc(model, moc_config)
+            prac_rank = logic.get("prac_rank")
+            if prac_rank is not None:
+                if logic.get("prac_all"):
+                    replace_linear_with_prac(model, principal_rank=prac_rank, random_rank=prac_rank)
+                elif logic.get("prac_ffn"):
+                    replace_linear_with_prac_ffn_only(model, principal_rank=prac_rank, random_rank=prac_rank)
             all_results[vid] = evaluate_all_tasks(
                 model, tokenizer, datasets,
                 device=primary_device, max_samples=args.max_samples, timer=timer, prefix=f"{vid}_"
@@ -1924,18 +2157,18 @@ def main():
             del model
             torch.cuda.empty_cache()
 
-            # 每完成一组任务就打印现有结果，并高亮本组新结果
-            print_results_table(all_results, tasks_to_run, timer, highlight_variant=vid)
+            print_results_table(all_results, tasks_to_run, timer, highlight_variant=vid, variant_order=variants_to_run)
 
         timer.stop("total")
 
-        print_results_table(all_results, tasks_to_run, timer)
+        print_results_table(all_results, tasks_to_run, timer, variant_order=variants_to_run)
         save_results_to_json(all_results, timer.times, config, args.output_dir)
         create_visualization(all_results, timer.times, args.output_dir)
 
-        num_tasks = len([t for t in tasks_to_run if t in all_results.get("original", {})])
+        first_variant = next((v for v in variants_to_run if v in all_results), None)
+        num_tasks = len(all_results[first_variant]) if first_variant else 0
         if num_tasks > 0:
-            for v in VARIANT_KEYS:
+            for v in variants_to_run:
                 if v in all_results:
                     avg = sum(all_results[v][t]["accuracy"] for t in all_results[v]) / num_tasks
                     print(f"  Avg {v}: {avg*100:.2f}%")

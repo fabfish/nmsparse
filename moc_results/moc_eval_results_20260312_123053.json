@@ -1,0 +1,96 @@
+{
+  "timestamp": "2026-03-12T12:30:53.269023",
+  "config": {
+    "model_path": "/data/models/Llama-3.1-8B-Instruct",
+    "cache_dir": "/data/datasets/",
+    "max_samples": null,
+    "tasks": [
+      "rte",
+      "boolq"
+    ],
+    "gpu_ids": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "moc_channels": null,
+    "timestamp": "2026-03-12T09:45:06.190790"
+  },
+  "results": {
+    "prac_all_60": {
+      "rte": {
+        "accuracy": 0.5126353790613718,
+        "correct": 142,
+        "total": 277,
+        "time": 203.38886666297913
+      },
+      "boolq": {
+        "accuracy": 0.4978593272171254,
+        "correct": 1628,
+        "total": 3270,
+        "time": 2559.0803949832916
+      }
+    },
+    "prac_all_50": {
+      "rte": {
+        "accuracy": 0.48014440433212996,
+        "correct": 133,
+        "total": 277,
+        "time": 190.41255569458008
+      },
+      "boolq": {
+        "accuracy": 0.4954128440366973,
+        "correct": 1620,
+        "total": 3270,
+        "time": 2279.846394777298
+      }
+    },
+    "prac_ffn_60": {
+      "rte": {
+        "accuracy": 0.5018050541516246,
+        "correct": 139,
+        "total": 277,
+        "time": 185.21545958518982
+      },
+      "boolq": {
+        "accuracy": 0.5045871559633027,
+        "correct": 1650,
+        "total": 3270,
+        "time": 2227.457587957382
+      }
+    },
+    "prac_ffn_50": {
+      "rte": {
+        "accuracy": 0.4729241877256318,
+        "correct": 131,
+        "total": 277,
+        "time": 176.8133647441864
+      },
+      "boolq": {
+        "accuracy": 0.5015290519877675,
+        "correct": 1640,
+        "total": 3270,
+        "time": 2103.1712107658386
+      }
+    }
+  },
+  "timing": {
+    "prac_all_60_rte": 203.38886666297913,
+    "prac_all_60_boolq": 2559.0803949832916,
+    "prac_all_50_rte": 190.41255569458008,
+    "prac_all_50_boolq": 2279.846394777298,
+    "prac_ffn_60_rte": 185.21545958518982,
+    "prac_ffn_60_boolq": 2227.457587957382,
+    "prac_ffn_50_rte": 176.8133647441864,
+    "prac_ffn_50_boolq": 2103.1712107658386,
+    "total": 9946.65154671669
+  },
+  "summary": {
+    "num_tasks": 2,
+    "avg_prac_all_60_accuracy": 0.5052473531392486,
+    "avg_prac_all_50_accuracy": 0.48777862418441365,
+    "avg_prac_ffn_60_accuracy": 0.5031961050574636,
+    "avg_prac_ffn_50_accuracy": 0.4872266198566997
+  }
+}

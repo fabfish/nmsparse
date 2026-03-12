@@ -17,8 +17,8 @@ Baseline: `test_rte_sparsity.py` (Original vs 2:4 sparse). Full benchmark: `moc_
 
 ### Accuracy by task (10 tasks)
 
-| Task | Orig | S_T25 | S_T50 | S_24 | S_28 | F_T25 | F_T50 | F_24 | F_28 | MoC_T25 | MoC_T50 | MoC_24 | MoC_28 | T25+S | T50+S | 24+S | 28+S | N |
-|------|------|-------|-------|------|------|-------|-------|------|------|---------|---------|--------|--------|-------|-------|------|------|---|
+| Task | Base | All-T25 | All-T50 | All-2:4 | All-2:8 | FFN-T25 | FFN-T50 | FFN-2:4 | FFN-2:8 | MoC-T25 | MoC-T50 | MoC-2:4 | MoC-2:8 | MoC+All-T25 | MoC+All-T50 | MoC+All-2:4 | MoC+All-2:8 | N |
+|------|------|---------|---------|--------|--------|---------|---------|--------|--------|---------|---------|--------|--------|-------------|-------------|------------|------------|---|
 | rte | **81.2** | 57.0 | 70.4 | 63.9 | 47.3 | 61.0 | **76.2** | 69.7 | 55.2 | 46.9 | 46.6 | 47.7 | 46.9 | 50.2 | 48.0 | 45.9 | 46.9 | 277 |
 | boolq | **85.4** | 51.5 | 80.5 | 69.5 | 37.8 | 66.5 | **82.1** | 79.9 | 55.0 | 41.0 | 40.7 | 44.1 | 39.8 | 46.9 | 45.5 | 49.1 | 44.7 | 3270 |
 | winogrande | 50.5 | 49.6 | 49.5 | 49.6 | 49.6 | 49.4 | 49.3 | **51.8** | 49.2 | 51.6 | 51.1 | 50.4 | **52.2** | 51.5 | 49.6 | 49.4 | 49.7 | 1267 |
@@ -30,7 +30,29 @@ Baseline: `test_rte_sparsity.py` (Original vs 2:4 sparse). Full benchmark: `moc_
 | longbench | **8.7** | 3.2 | 8.6 | 8.1 | 2.2 | 6.7 | **9.2** | 8.6 | 5.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 200 |
 | **AVG** | **65.3** | 34.4 | 54.7 | 41.3 | 31.5 | 39.1 | **59.8** | 54.1 | 35.3 | 31.5 | 31.4 | 32.3 | 31.4 | 32.9 | 32.3 | 32.6 | 32.4 | |
 
-**Legend**: Orig=base | S_*=sparse_all, F_*=sparse_ffn | MoC_*=MoC (FFN only) | *+S=MoC+sparse | T25/T50=Top-K 25%/50%, 24/28=2:4 2:8.
+**Legend**: Base=original | All-*=sparse_all, FFN-*=sparse_ffn | MoC-*=MoC (FFN only) | MoC+All-*=MoC+sparse_all | T25/T50=Top-K 25%/50%, 2:4/2:8=2:4 2:8.
+
+### Column legend (readable shorthand)
+
+| Header | Meaning | Variant name |
+|--------|---------|--------------|
+| Base | dense baseline (no sparsity) | `original` |
+| All-T25 | activation sparsity on all linears, Top-K 25% | `sparse_all_topk` |
+| All-T50 | activation sparsity on all linears, Top-K 50% | `sparse_all_topk_50` |
+| All-2:4 | activation sparsity on all linears, 2:4 | `sparse_all_2_4` |
+| All-2:8 | activation sparsity on all linears, 2:8 | `sparse_all_2_8` |
+| FFN-T25 | activation sparsity on FFN only, Top-K 25% | `sparse_ffn_topk` |
+| FFN-T50 | activation sparsity on FFN only, Top-K 50% | `sparse_ffn_topk_50` |
+| FFN-2:4 | activation sparsity on FFN only, 2:4 | `sparse_ffn_2_4` |
+| FFN-2:8 | activation sparsity on FFN only, 2:8 | `sparse_ffn_2_8` |
+| MoC-T25 | MoC in FFN only, Top-K 25% | `moc_topk` |
+| MoC-T50 | MoC in FFN only, Top-K 50% | `moc_topk_50` |
+| MoC-2:4 | MoC in FFN only, 2:4 | `moc_2_4` |
+| MoC-2:8 | MoC in FFN only, 2:8 | `moc_2_8` |
+| MoC+All-T25 | MoC (FFN) + sparse_all, Top-K 25% | `moc_topk_sparse` |
+| MoC+All-T50 | MoC (FFN) + sparse_all, Top-K 50% | `moc_topk_50_sparse` |
+| MoC+All-2:4 | MoC (FFN) + sparse_all, 2:4 | `moc_2_4_sparse` |
+| MoC+All-2:8 | MoC (FFN) + sparse_all, 2:8 | `moc_2_8_sparse` |
 
 ### Average accuracy by variant
 
@@ -62,6 +84,19 @@ Baseline: `test_rte_sparsity.py` (Original vs 2:4 sparse). Full benchmark: `moc_
 - **winogrande** and **piqa** show smaller gaps; **rte / boolq / arc_*** and **mmlu** show larger drops under sparsity/MoC.
 
 ---
+
+## PRAC results (from `prac_only_run.log`)
+
+| prac_only_run.log (single-column summary) |
+|---|
+| Dense baseline (`Base`, from Full Run table): `rte`=0.812, `boolq`=0.854, AVG(rte+boolq)=0.833 |
+| `prac_all_60`: Avg Acc = **50.52%** |
+| `prac_all_50`: Avg Acc = **48.78%** |
+| `prac_ffn_60`: Avg Acc = **50.32%** |
+| `prac_ffn_50`: Avg Acc = **48.72%** |
+| `rte` (N=277): P_60=0.513, P_50=0.480, PF_60=0.502, PF_50=0.473 |
+| `boolq` (N=3270): P_60=0.498, P_50=0.495, PF_60=0.505, PF_50=0.502 |
+| AVG (rte+boolq): P_60=0.505, P_50=0.488, PF_60=0.503, PF_50=0.487 |
 
 ## Usage
 

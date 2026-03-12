@@ -90,10 +90,10 @@ Baseline: `test_rte_sparsity.py` (Original vs 2:4 sparse). Full benchmark: `moc_
 | prac_only_run.log (single-column summary) |
 |---|
 | Dense baseline (`Base`, from Full Run table): `rte`=0.812, `boolq`=0.854, AVG(rte+boolq)=0.833 |
-| `prac_all_60`: Avg Acc = **50.52%** |
-| `prac_all_50`: Avg Acc = **48.78%** |
-| `prac_ffn_60`: Avg Acc = **50.32%** |
-| `prac_ffn_50`: Avg Acc = **48.72%** |
+| `prac_all_60`: `rte`=0.513, `boolq`=0.498, AVG=**0.505**  |
+| `prac_all_50`: `rte`=0.480, `boolq`=0.495, AVG=**0.488**  |
+| `prac_ffn_60`: `rte`=0.502, `boolq`=0.505, AVG=**0.503**  |
+| `prac_ffn_50`: `rte`=0.473, `boolq`=0.502, AVG=**0.487**  |
 | `rte` (N=277): P_60=0.513, P_50=0.480, PF_60=0.502, PF_50=0.473 |
 | `boolq` (N=3270): P_60=0.498, P_50=0.495, PF_60=0.505, PF_50=0.502 |
 | AVG (rte+boolq): P_60=0.505, P_50=0.488, PF_60=0.503, PF_50=0.487 |
